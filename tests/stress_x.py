@@ -2,7 +2,8 @@
 that behave like the real ones (20 tweets per page, a trailing empty page, 15 credits per tweet
 and at least 15 per call, since_time inclusive / until_time exclusive, (from:a OR from:b) queries).
 
-Each scenario runs x.main() every 6 hours (with a few minutes of trigger jitter) for DAYS days
+Each scenario runs x.main() on GitHub's 6-hour schedule (runs start 0-30 minutes late, and
+about 3% are skipped, as GitHub's scheduler does under load) for DAYS days
 over a set of accounts and checks: no missed original tweets, no duplicates, no backfill,
 Reviewed marks kept, and credit usage.
 Run: python3 tests/stress_x.py
@@ -139,7 +140,9 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
     runs = days * 4 + 1
     for i in range(runs):
         day = i / 4
-        SIM["now"] = T0 + timedelta(hours=6 * i, minutes=rnd.uniform(-4, 4))  # Make.com jitter
+        SIM["now"] = T0 + timedelta(hours=6 * i, minutes=rnd.uniform(0, 30))  # GitHub schedule delay
+        if 0 < i < runs - 1 and rnd.random() < 0.03:
+            continue  # GitHub skipped this scheduled run
         for j, (h, aid, _) in enumerate(specs):
             if j not in first_run_at and day >= added_day.get(j, 0):
                 accounts.append({"id": f"acc{j}", "fields": {x.A_NAME: h, x.A_PLATFORM: "X", x.A_PLATFORM_ID: aid,
@@ -215,7 +218,7 @@ def show(name, r, loss_expected=False):
 
 
 if __name__ == "__main__":
-    print("== Clean (runs every 6h with +-4 min trigger jitter) ==")
+    print("== Clean (GitHub schedule: runs 0-30 min late, ~3% skipped) ==")
     show("6 accounts x 3/day", simulate([3] * 6))
     show("20 accounts x 3/day (2 batches)", simulate([3] * 20))
     show("20 accounts, mixed 0.3-10/day", simulate([0.3, 1, 2, 3, 5, 8, 10, 1, 2, 3] * 2))
