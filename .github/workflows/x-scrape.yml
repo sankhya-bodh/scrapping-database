@@ -1,8 +1,12 @@
 name: X scrape
 
-# Started every 6 hours by Make.com (an HTTP POST to this workflow's dispatch API),
-# or by hand from the Actions tab. See README.md, "Deployment".
+# Runs every 6 hours on GitHub's own schedule, or by hand from the Actions tab.
+# 17 minutes past the hour (UTC): GitHub delays scheduled runs most at the top of the hour.
+# A late or skipped run loses nothing: the next one reads from where the last successful
+# run ended (up to 72 hours back).
 on:
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 # One run at a time: a run started while another is going waits for it to finish.

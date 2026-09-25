@@ -57,18 +57,11 @@ They also run on GitHub on every push (`.github/workflows/tests.yml`).
 
 ## Deployment (X scraper on GitHub Actions)
 
-`.github/workflows/x-scrape.yml` runs `scripts/x.py`. Make.com starts it every 6 hours through GitHub's API. Only one run happens at a time: a run started while another is going waits for it to finish.
+`.github/workflows/x-scrape.yml` runs `scripts/x.py` on GitHub's own schedule, every 6 hours at 00:17, 06:17, 12:17 and 18:17 UTC. You can also start it by hand: Actions → X scrape → Run workflow. Only one run happens at a time: a run started while another is going waits for it to finish.
 
-1. **Repository secrets** (Settings → Secrets and variables → Actions): add `AIRTABLE_ACCESS_TOKEN` and `TWITTER_API`.
-2. **A GitHub token for Make.com.** Create a fine-grained personal access token with:
-   - access to this repository only;
-   - the permission **Actions: Read and write**.
-3. **Make.com scenario.** Add a Schedule trigger set to every 6 hours, followed by an HTTP "Make a request" module:
-   - Method: `POST`
-   - URL: `https://api.github.com/repos/<owner>/<repo>/actions/workflows/x-scrape.yml/dispatches`
-   - Headers: `Authorization: Bearer <token>`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`
-   - Body (JSON): `{"ref": "main"}`
-   - GitHub answers `204 No Content` when the run has started.
-4. **Alerts.** A run that fails (exit code 1) shows red in the Actions tab, and GitHub emails the token's owner. The failing accounts are also marked `error` in Airtable, with the reason in Scrape Error.
+1. **Repository secrets** (Settings → Secrets and variables → Actions): `AIRTABLE_ACCESS_TOKEN` and `TWITTER_API`. `SCRAPE_CREATORS` is there for the other scrapers.
+2. **Timing:** GitHub can start scheduled runs late, or occasionally skip one, when it's busy. No tweets are lost: each run reads from where the last successful run ended, up to 72 hours back.
+3. **60-day rule:** GitHub turns off scheduled workflows in a public repository after 60 days with no activity (commits, issues, pull requests). It emails a warning first. To turn it back on, make any commit, or open Actions → X scrape → Enable workflow.
+4. **Alerts:** a run that fails (exit code 1) shows red in the Actions tab, and GitHub emails the repository owner. The failing accounts are also marked `error` in Airtable, with the reason in Scrape Error.
 
 In a public repository, the Actions run logs are public. They show account handles, tweet counts and error messages, but never the keys: GitHub masks secrets in the logs.
