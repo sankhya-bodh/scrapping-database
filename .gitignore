@@ -1,0 +1,15 @@
+# Secrets: API keys live in .env locally and in GitHub Actions secrets on GitHub.
+.env
+
+# Internal notes (tracked creators, record IDs, history), kept locally only.
+project.md
+
+# Raw API responses (real accounts' data), kept locally only. Tests use tests/fixtures/.
+samples/
+
+# Lock file that stops two local runs overlapping.
+.x_scrape.lock
+
+__pycache__/
+*.pyc
+.DS_Store

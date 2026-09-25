@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Reddit scraper for the Content OS Database Airtable base.
+
+For every Accounts row with Scrape = Active and Platform = Reddit:
+  1. Fetch the subreddit's top posts of the week from ScrapeCreators (reddit/subreddit),
+     exactly one call per subreddit: no retries, no fallback call, no paging.
+  2. Create new posts in Reddit Posts (Status = New, Media) and refresh existing
+     ones (every field except Status, so "Reviewed" marks are kept).
+     Media is only sent when the stored field is empty, so files are never duplicated.
+     Reddit videos need a free DASHPlaylist.mpd fetch from v.redd.it; if that fails
+     the post is saved without Media and the next run tries again.
+  3. Record Last Scraped / Last Scrape Status / Scrape Error on the account.
+
+Runs unattended (standard library only). Keys come from ../.env or the
+environment: AIRTABLE_ACCESS_TOKEN, SCRAPE_CREATORS. See project.md.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+AIRTABLE_API = "https://api.airtable.com/v0"
+BASE_ID = "appNPeZ6BoFaLfP5C"
+SC_API = "https://api.scrapecreators.com"
+REDDIT_URL = "https://www.reddit.com"
+
+# Accounts tbl04PJf51XEAiA8h
+ACCOUNTS = "tbl04PJf51XEAiA8h"
+A_NAME = "fldPwDwLjGikNchgw"
+A_PLATFORM = "fldWYqll9jXSskuSC"
+A_HANDLE = "fldABp0JmnZKyiajW"
+A_SCRAPE = "flduo9Gt6GDKLEEs3"
+A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
+A_LAST_STATUS = "flduqhmL46oI0XJPo"
+A_SCRAPE_ERROR = "flde8rfQchM6wk7Ho"
+
+# Reddit Posts tblGeKN96WduU1LST
+POSTS = "tblGeKN96WduU1LST"
+P_TITLE = "fldNP4fmDla9qXRJN"
+P_POST_ID = "fldFA9UHqN8OZCCEX"
+P_ACCOUNT = "fldQPEPJd9P1BwwTC"
+P_URL = "fldpHZh1dyuZOWhAV"
+P_AUTHOR = "fldokpQfytz0xdvvH"
+P_BODY = "fld6sJSqSR6RsA6TB"
+P_FLAIR = "fldjC74rWqnWwOHJi"
+P_PUBLISHED = "fldjCepCEwDTb6gCC"
+P_SCORE = "fldwZ699jquLi9sCH"
+P_UPVOTE_RATIO = "fldw8xKMJtiZWM8xK"
+P_COMMENTS = "fldbAoITrwj2unEM5"
+P_STATUS = "fld8DyHomv6kif3Mp"
+P_LAST_SCRAPED = "fldqWd5fN3bSOwhY5"
+P_MEDIA = "fld9xymRDoAepsUwn"
+
+# v.redd.it serves CMAF files to browser-like clients; a bare urllib UA may be refused.
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+BATCH = 10  # Airtable's max records per write request
+
+
+class HttpError(Exception):
+    pass
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def load_env():
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().removeprefix("export ").strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+    missing = [k for k in ("AIRTABLE_ACCESS_TOKEN", "SCRAPE_CREATORS") if not os.environ.get(k)]
+    if missing:
+        sys.exit(f"Missing required keys: {', '.join(missing)} (set them in {env_file})")
+
+
+def request(method, url, headers, body=None, timeout=90, rate_limit_waits=0):
+    """JSON request, no retries on failure. rate_limit_waits only covers Airtable's free 429s."""
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {**headers, "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    for attempt in range(rate_limit_waits + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            if e.code == 429 and attempt < rate_limit_waits:
+                time.sleep(30)
+                continue
+            raise HttpError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).path}: {detail}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            raise HttpError(f"Network error for {urllib.parse.urlsplit(url).path}: {e}") from None
+
+
+def fetch_text(url, timeout=30):
+    """Plain-text GET with a browser User-Agent, single attempt (used for v.redd.it)."""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise HttpError(f"HTTP {e.code} from {url}") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise HttpError(f"Network error for {url}: {e}") from None
+
+
+# --- Airtable -------------------------------------------------------------
+
+def airtable(method, table, params=None, body=None):
+    url = f"{AIRTABLE_API}/{BASE_ID}/{table}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    headers = {"Authorization": f"Bearer {os.environ['AIRTABLE_ACCESS_TOKEN']}"}
+    # Airtable 429 = 5 req/s limit; waiting is free and avoids losing an already-paid scrape.
+    return request(method, url, headers, body, rate_limit_waits=2)
+
+
+def list_records(table, field_ids):
+    """All records of a table (following offset paging), fields keyed by field ID."""
+    records, offset = [], None
+    while True:
+        params = {"pageSize": 100, "returnFieldsByFieldId": "true", "fields[]": field_ids}
+        if offset:
+            params["offset"] = offset
+        page = airtable("GET", table, params)
+        records.extend(page.get("records", []))
+        offset = page.get("offset")
+        if not offset:
+            return records
+
+
+def write_batches(method, table, records):
+    """POST (create) or PATCH (update) records in batches of BATCH."""
+    done = []
+    for i in range(0, len(records), BATCH):
+        result = airtable(method, table, body={"records": records[i:i + BATCH]})
+        done.extend(result.get("records", []))
+    return done
+
+
+# --- ScrapeCreators -------------------------------------------------------
+
+def scrapecreators(path, params=None):
+    url = f"{SC_API}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = request("GET", url, {"x-api-key": os.environ["SCRAPE_CREATORS"]})
+    if isinstance(data, dict) and data.get("success") is False:
+        raise HttpError(f"{path} returned success=false: {str(data.get('message') or data)[:300]}")
+    return data
+
+
+def fetch_posts(subreddit):
+    """One paid call, first page only ("after" is ignored).
+    Returns (posts, credits_charged, credits_remaining)."""
+    data = scrapecreators("/v1/reddit/subreddit",
+                          {"subreddit": subreddit, "sort": "top", "timeframe": "week"})
+    return data.get("posts") or [], data.get("credits_charged"), data.get("credits_remaining")
+
+
+# --- Mapping --------------------------------------------------------------
+
+def to_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_int(value):
+    number = to_float(value)
+    return int(number) if number is not None else None
+
+
+def to_utc(value):
+    """ISO 8601 (with offset or Z) -> ISO UTC string, or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def unix_to_utc(value):
+    """Unix seconds -> ISO UTC string, or None."""
+    seconds = to_int(value)
+    if seconds is None:
+        return None
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def thread_url(post):
+    """The Reddit thread link, built from permalink (posts[].url is the linked content)."""
+    permalink = (post.get("permalink") or "").strip()
+    if not permalink:
+        return None
+    if permalink.startswith("http"):
+        return permalink
+    return REDDIT_URL + "/" + permalink.lstrip("/")
+
+
+def file_number(name):
+    """The last number in a file name, ignoring the extension (CMAF_720.mp4 -> 720), 0 if none."""
+    stem = os.path.splitext(name.split("?")[0].rsplit("/", 1)[-1])[0]
+    numbers = re.findall(r"\d+", stem)
+    return int(numbers[-1]) if numbers else 0
+
+
+def video_files(post_id, video_url):
+    """Read {video_url}/DASHPlaylist.mpd (one free request to Reddit, no retry) and return
+    attachments for the best video file and the best audio file. Raises HttpError."""
+    base = video_url.split("?")[0].rstrip("/")
+    playlist = fetch_text(f"{base}/DASHPlaylist.mpd")
+    names = [n.strip() for n in re.findall(r"<BaseURL>(.*?)</BaseURL>", playlist, re.S) if n.strip()]
+    videos = [n for n in names if "audio" not in n.lower()]
+    audios = [n for n in names if "audio" in n.lower()]
+    if not videos:  # audio alone isn't worth attaching; leave Media empty for the next run
+        raise HttpError(f"no video file listed in {base}/DASHPlaylist.mpd")
+    files = []
+    for group, suffix in ((videos, "video"), (audios, "audio")):
+        if group:  # silent videos have no audio file; attach the video alone
+            best = max(group, key=file_number)
+            url = best if best.startswith("http") else f"{base}/{best}"
+            files.append({"url": url, "filename": f"{post_id}_{suffix}.mp4"})
+    return files
+
+
+def media_files(post):
+    """Attachment list for the Media field: image post -> the image, v.redd.it -> video and
+    audio. Galleries, text and link posts -> empty list. Raises HttpError if a playlist fails."""
+    post_id = post.get("id")
+    url = (post.get("url") or "").strip()
+    if post.get("post_hint") == "image" and "i.redd.it" in url:
+        ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".jpg"
+        return [{"url": url, "filename": f"{post_id}{ext}"}]
+    if "v.redd.it" in url:
+        return video_files(post_id, url)
+    return []
+
+
+def post_fields(post, account_id, now, existing=None):
+    """Airtable fields for one post (Media is added separately). `existing` is None for a
+    new post, otherwise the stored record's info. Status only on create, never on update."""
+    fields = {
+        P_TITLE: post.get("title"),
+        P_POST_ID: post.get("id"),
+        P_ACCOUNT: [account_id],
+        P_URL: thread_url(post),
+        P_AUTHOR: post.get("author"),
+        P_BODY: post.get("selftext"),
+        P_FLAIR: post.get("link_flair_text"),
+        P_PUBLISHED: to_utc(post.get("created_at_iso")) or unix_to_utc(post.get("created_utc")),
+        P_SCORE: to_int(post.get("score")),
+        P_UPVOTE_RATIO: to_float(post.get("upvote_ratio")),  # 0-1; the percent field expects that
+        P_COMMENTS: to_int(post.get("num_comments")),
+        P_LAST_SCRAPED: now,
+    }
+    if existing is None:
+        fields[P_STATUS] = "New"
+    # Omit missing or empty values rather than blanking out what's already stored.
+    return {k: v for k, v in fields.items() if v is not None and v != "" and v != []}
+
+
+# --- Main -----------------------------------------------------------------
+
+def scrape_account(account, existing, now):
+    """Scrape one subreddit; mutates `existing` (post ID -> record info). Returns stats."""
+    fields = account["fields"]
+    subreddit = (fields.get(A_HANDLE) or "").strip().lstrip("/")
+    if subreddit.lower().startswith("r/"):
+        subreddit = subreddit[2:]
+    subreddit = subreddit.strip("/")
+    if not subreddit:
+        raise ValueError("Handle (subreddit) is empty")
+
+    posts, charged, remaining = fetch_posts(subreddit)
+    stats = {"created": 0, "updated": 0, "media_added": 0, "media_skipped": 0,
+             "returned": len(posts), "credits": charged, "remaining": remaining}
+    creates, updates, seen = [], [], set()
+    for post in posts:
+        pid = post.get("id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        info = existing.get(pid)
+        record = {"fields": post_fields(post, account["id"], now, info)}
+        # Attach media once; never re-send a filled field (that would duplicate files).
+        if info is None or not info["media"]:
+            try:
+                files = media_files(post)
+            except HttpError as e:  # not an account error: Media stays empty, next run retries
+                files = []
+                stats["media_skipped"] += 1
+                log(f"  Media skipped for {pid}: {e}")
+            if files:
+                record["fields"][P_MEDIA] = files
+        if info is None:
+            creates.append(record)
+        else:
+            record["id"] = info["id"]
+            updates.append(record)
+
+    try:
+        # One batch at a time so the stats stay accurate if a later batch fails.
+        for method, records, key in (("PATCH", updates, "updated"), ("POST", creates, "created")):
+            for i in range(0, len(records), BATCH):
+                batch = records[i:i + BATCH]
+                written = write_batches(method, POSTS, batch)
+                stats[key] += len(written)
+                stats["media_added"] += sum(len(r["fields"].get(P_MEDIA, [])) for r in batch)
+                for sent, rec in zip(batch, written):
+                    pid = sent["fields"][P_POST_ID]
+                    info = existing.setdefault(pid, {"id": rec["id"], "media": False})
+                    info["media"] = info["media"] or P_MEDIA in sent["fields"]
+    except Exception as e:
+        e.stats = stats  # the scrape was paid for; keep its credit numbers in the summary
+        raise
+    return stats
+
+
+def main():
+    load_env()
+    started = datetime.now(timezone.utc)
+    log("Reddit scrape started")
+
+    accounts = [
+        a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_HANDLE, A_SCRAPE])
+        if a["fields"].get(A_SCRAPE) == "Active" and a["fields"].get(A_PLATFORM) == "Reddit"
+    ]
+    log(f"{len(accounts)} active Reddit account(s)")
+
+    # Empty attachment fields are left out of Airtable's response, so presence = filled.
+    existing = {
+        r["fields"][P_POST_ID]: {"id": r["id"], "media": bool(r["fields"].get(P_MEDIA))}
+        for r in list_records(POSTS, [P_POST_ID, P_MEDIA])
+        if r["fields"].get(P_POST_ID)
+    }
+    log(f"{len(existing)} post(s) already in Reddit Posts")
+
+    results, remaining = [], None
+    for account in accounts:
+        name = account["fields"].get(A_NAME) or account["id"]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        log(f"Scraping {name}")
+        try:
+            stats = scrape_account(account, existing, now)
+            status, error = "ok", None
+        except Exception as e:  # no retries: record on the account and move on
+            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "media_added": 0,
+                                                  "media_skipped": 0, "returned": 0,
+                                                  "credits": None, "remaining": None}
+            status, error = "error", f"{now} {type(e).__name__}: {e}"[:5000]
+            log(f"  ERROR: {error}")
+        remaining = stats["remaining"] if stats["remaining"] is not None else remaining
+
+        try:
+            airtable("PATCH", ACCOUNTS, body={"records": [{"id": account["id"], "fields": {
+                A_LAST_SCRAPED: now, A_LAST_STATUS: status, A_SCRAPE_ERROR: error}}]})
+        except HttpError as e:
+            log(f"  Could not update account row: {e}")
+
+        results.append((name, status, stats, error))
+
+    print()
+    print("Summary")
+    for name, status, stats, error in results:
+        used = stats["credits"] if stats["credits"] is not None else 0
+        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']}"
+              f" (of {stats['returned']} returned) | media files added {stats['media_added']},"
+              f" media skipped {stats['media_skipped']} | credits used {used}")
+        if error:
+            print(f"    error: {error}")
+    total = sum(s["credits"] or 0 for _, _, s, _ in results)
+    print(f"  Total credits used: {total} | credits remaining: {remaining if remaining is not None else '?'}")
+    print(f"  Duration: {(datetime.now(timezone.utc) - started).total_seconds():.1f}s")
+
+    return 1 if any(r[1] == "error" for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

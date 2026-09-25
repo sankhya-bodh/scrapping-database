@@ -1,0 +1,30 @@
+name: X scrape
+
+# Started every 6 hours by Make.com (an HTTP POST to this workflow's dispatch API),
+# or by hand from the Actions tab. See README.md, "Deployment".
+on:
+  workflow_dispatch:
+
+# One run at a time: a run started while another is going waits for it to finish.
+# Two overlapping runs could both create the same tweets.
+concurrency:
+  group: x-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scrape X
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          TWITTER_API: ${{ secrets.TWITTER_API }}
+        run: python3 scripts/x.py

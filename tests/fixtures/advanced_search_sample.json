@@ -1,0 +1,264 @@
+{
+ "tweets": [
+  {
+   "type": "tweet",
+   "id": "2000000000000000001",
+   "url": "https://x.com/example_user/status/2000000000000000001",
+   "twitterUrl": "https://twitter.com/example_user/status/2000000000000000001",
+   "text": "Quoting this because it fits a gap I keep noticing in the tools I use.",
+   "source": "Twitter Web App",
+   "retweetCount": 2,
+   "replyCount": 6,
+   "likeCount": 29,
+   "quoteCount": 0,
+   "viewCount": 5148,
+   "createdAt": "Wed Sep 23 16:21:20 +0000 2026",
+   "lang": "en",
+   "bookmarkCount": 17,
+   "isReply": false,
+   "inReplyToId": null,
+   "conversationId": "2000000000000000001",
+   "displayTextRange": [
+    0,
+    70
+   ],
+   "inReplyToUserId": null,
+   "inReplyToUsername": null,
+   "extendedEntities": {},
+   "place": {},
+   "entities": {
+    "hashtags": [],
+    "symbols": [],
+    "urls": [],
+    "user_mentions": []
+   },
+   "retweeted_tweet": null,
+   "isLimitedReply": false,
+   "author": {
+    "type": "user",
+    "id": "1000000000000000001",
+    "userName": "example_user",
+    "name": "Example User",
+    "isBlueVerified": true,
+    "followers": 12345,
+    "following": 678
+   },
+   "article": null,
+   "card": null,
+   "communityInfo": null,
+   "quoted_tweet": {
+    "type": "tweet",
+    "id": "3000000000000000001",
+    "url": "https://x.com/other_example/status/3000000000000000001",
+    "text": "The post being quoted.",
+    "author": {
+     "type": "user",
+     "id": "1000000000000000002",
+     "userName": "other_example",
+     "name": "Other Example"
+    },
+    "isReply": false,
+    "extendedEntities": {
+     "media": [
+      {
+       "type": "video",
+       "media_url_https": "https://pbs.twimg.com/media/example_1.jpg",
+       "video_info": {
+        "aspect_ratio": [
+         16,
+         9
+        ],
+        "duration_millis": 37994,
+        "variants": [
+         {
+          "content_type": "application/x-mpegURL",
+          "url": "https://video.twimg.com/example/1/0.m3u8"
+         },
+         {
+          "bitrate": 256000,
+          "content_type": "video/mp4",
+          "url": "https://video.twimg.com/example/1/1.mp4"
+         },
+         {
+          "bitrate": 832000,
+          "content_type": "video/mp4",
+          "url": "https://video.twimg.com/example/1/2.mp4"
+         },
+         {
+          "bitrate": 2176000,
+          "content_type": "video/mp4",
+          "url": "https://video.twimg.com/example/1/3.mp4"
+         },
+         {
+          "bitrate": 10368000,
+          "content_type": "video/mp4",
+          "url": "https://video.twimg.com/example/1/4.mp4"
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "type": "tweet",
+   "id": "2000000000000000002",
+   "url": "https://x.com/example_user/status/2000000000000000002",
+   "twitterUrl": "https://twitter.com/example_user/status/2000000000000000002",
+   "text": "A longer post to check that full text survives past the preview limit. A longer post to check that full text survives past the preview limit. A longer post to check that full text survives past the preview limit. A longer post to check that full text survives past the preview limit. A longer post to check that full text survives past the preview limit. End of the long post.",
+   "source": "Twitter Web App",
+   "retweetCount": 3,
+   "replyCount": 33,
+   "likeCount": 185,
+   "quoteCount": 3,
+   "viewCount": 8519,
+   "createdAt": "Wed Sep 23 10:36:09 +0000 2026",
+   "lang": "en",
+   "bookmarkCount": 41,
+   "isReply": false,
+   "inReplyToId": null,
+   "conversationId": "2000000000000000002",
+   "displayTextRange": [
+    0,
+    280
+   ],
+   "inReplyToUserId": null,
+   "inReplyToUsername": null,
+   "extendedEntities": {},
+   "place": {},
+   "entities": {
+    "hashtags": [],
+    "symbols": [],
+    "urls": [],
+    "user_mentions": []
+   },
+   "retweeted_tweet": null,
+   "isLimitedReply": false,
+   "author": {
+    "type": "user",
+    "id": "1000000000000000001",
+    "userName": "example_user",
+    "name": "Example User",
+    "isBlueVerified": true,
+    "followers": 12345,
+    "following": 678
+   },
+   "article": null,
+   "card": null,
+   "communityInfo": null,
+   "quoted_tweet": null
+  },
+  {
+   "type": "tweet",
+   "id": "2000000000000000003",
+   "url": "https://x.com/example_user/status/2000000000000000003",
+   "twitterUrl": "https://twitter.com/example_user/status/2000000000000000003",
+   "text": "Another quote post, with a second line.\n\nAnd a third paragraph.",
+   "source": "Twitter Web App",
+   "retweetCount": 2,
+   "replyCount": 6,
+   "likeCount": 47,
+   "quoteCount": 0,
+   "viewCount": 7989,
+   "createdAt": "Tue Sep 22 22:29:56 +0000 2026",
+   "lang": "en",
+   "bookmarkCount": 47,
+   "isReply": false,
+   "inReplyToId": null,
+   "conversationId": "2000000000000000003",
+   "displayTextRange": [
+    0,
+    63
+   ],
+   "inReplyToUserId": null,
+   "inReplyToUsername": null,
+   "extendedEntities": {},
+   "place": {},
+   "entities": {
+    "hashtags": [],
+    "symbols": [],
+    "urls": [],
+    "user_mentions": []
+   },
+   "retweeted_tweet": null,
+   "isLimitedReply": false,
+   "author": {
+    "type": "user",
+    "id": "1000000000000000001",
+    "userName": "example_user",
+    "name": "Example User",
+    "isBlueVerified": true,
+    "followers": 12345,
+    "following": 678
+   },
+   "article": null,
+   "card": null,
+   "communityInfo": null,
+   "quoted_tweet": {
+    "type": "tweet",
+    "id": "3000000000000000003",
+    "url": "https://x.com/other_example/status/3000000000000000003",
+    "text": "The post being quoted.",
+    "author": {
+     "type": "user",
+     "id": "1000000000000000002",
+     "userName": "other_example",
+     "name": "Other Example"
+    },
+    "isReply": false,
+    "extendedEntities": {}
+   }
+  },
+  {
+   "type": "tweet",
+   "id": "2000000000000000004",
+   "url": "https://x.com/example_user/status/2000000000000000004",
+   "twitterUrl": "https://twitter.com/example_user/status/2000000000000000004",
+   "text": "Is typing faster &amp; more structured than dictation?",
+   "source": "Twitter Web App",
+   "retweetCount": 5,
+   "replyCount": 101,
+   "likeCount": 269,
+   "quoteCount": 1,
+   "viewCount": 23117,
+   "createdAt": "Tue Sep 22 13:31:33 +0000 2026",
+   "lang": "en",
+   "bookmarkCount": 21,
+   "isReply": false,
+   "inReplyToId": null,
+   "conversationId": "2000000000000000004",
+   "displayTextRange": [
+    0,
+    54
+   ],
+   "inReplyToUserId": null,
+   "inReplyToUsername": null,
+   "extendedEntities": {},
+   "place": {},
+   "entities": {
+    "hashtags": [],
+    "symbols": [],
+    "urls": [],
+    "user_mentions": []
+   },
+   "retweeted_tweet": null,
+   "isLimitedReply": false,
+   "author": {
+    "type": "user",
+    "id": "1000000000000000001",
+    "userName": "example_user",
+    "name": "Example User",
+    "isBlueVerified": true,
+    "followers": 12345,
+    "following": 678
+   },
+   "article": null,
+   "card": null,
+   "communityInfo": null,
+   "quoted_tweet": null
+  }
+ ],
+ "has_next_page": true,
+ "next_cursor": "FIXTURE_CURSOR_PAGE_2"
+}
