@@ -1,6 +1,7 @@
 name: X scrape
 
-# Runs every 6 hours on GitHub's own schedule, or by hand from the Actions tab.
+# Runs every 6 hours on GitHub's own schedule, or by hand from the Actions tab. Each run reads
+# the last 8 hours of tweets for every active X account (new accounts: their last 24 hours).
 # 17 minutes past the hour (UTC): GitHub delays scheduled runs most at the top of the hour.
 # A late or skipped run loses nothing: the next one reads from where the last successful
 # run ended (up to 72 hours back).
@@ -9,8 +10,8 @@ on:
     - cron: "17 */6 * * *"
   workflow_dispatch:
 
-# One run at a time: a run started while another is going waits for it to finish.
-# Two overlapping runs could both create the same tweets.
+# One run at a time, shared with x-new-account.yml: a run started while another is going waits
+# for it to finish. Two overlapping runs could both create the same tweets.
 concurrency:
   group: x-scrape
   cancel-in-progress: false

@@ -6,12 +6,14 @@ Runs every 6 hours. For the Accounts rows with Scrape = Active and Platform = X:
      (tweet/advanced_search), following the twitterapi.io "monitor accounts for new
      tweets" guide, with up to HANDLES_PER_QUERY accounts batched into one query:
        (from:a OR from:b ...) since_time:<unix> until_time:<unix> -filter:replies -filter:retweets
-     until_time = the moment the run starts. since_time = where the batch's last fully read
-     window ended (its accounts' Last Scraped), minus OVERLAP_MINUTES for tweets the search
-     indexes late. So a run normally reads just the previous 6 hours, and after a failed run
-     the next one re-reads the gap (at most MAX_CATCHUP_HOURS). Accounts are batched with
-     others whose Last Scraped is about the same, so one behind doesn't rewind the rest.
-     A newly added account (or one resumed after a long pause) starts now: no backfill.
+     until_time = the moment the run starts. since_time = WINDOW_HOURS back, or earlier if
+     the batch's last fully read window (its accounts' Last Scraped) ended before that, minus
+     OVERLAP_MINUTES for tweets the search indexes late. So a run normally reads the last
+     8 hours, and after a failed run the next one re-reads the gap (at most MAX_CATCHUP_HOURS).
+     Accounts are batched with others whose Last Scraped is about the same, so one behind
+     doesn't rewind the rest. A newly added account (no Last Scraped, or a resumed one whose
+     Last Scraped is older than MAX_CATCHUP_HOURS) is read in its own batch from
+     NEW_ACCOUNT_HOURS back: its last 24 hours, no further.
      Long (catch-up) windows are read oldest-first in SLICE_HOURS slices. Pages are followed
      as in the guide (while has_next_page and next_cursor), stopping early on an empty or
      repeated page. A query that hits MAX_PAGES continues with the older rest of its slice,
@@ -25,6 +27,10 @@ Runs every 6 hours. For the Accounts rows with Scrape = Active and Platform = X:
   3. On each account: Last Scraped = end of the last fully read and saved slice (never moved
      past anything unread), Last Scrape Status, Scrape Error.
 Only one run at a time: a second run started while one is going exits (lock file).
+
+  python3 scripts/x.py                 scheduled run: every active X account
+  python3 scripts/x.py --new-accounts  only the newly added accounts (their last 24 hours);
+                                       started when an account is added. Does nothing if none.
 
 Runs unattended (standard library only). Keys come from ../.env or the
 environment: AIRTABLE_ACCESS_TOKEN, TWITTER_API. See project.md.
@@ -77,8 +83,10 @@ P_MEDIA = "fldp6WngAiPjfzOfD"
 P_STATUS = "fldzDBcbEeiojh8ct"
 P_LAST_SCRAPED = "fldGGg2QCSALoXka0"
 
-RUN_HOURS = 6             # schedule interval; a new account's first window (no backfill)
-OVERLAP_MINUTES = 15      # each window starts this much before the last one ended
+RUN_HOURS = 6             # schedule interval
+WINDOW_HOURS = 8          # each scheduled run reads at least the last 8 hours
+NEW_ACCOUNT_HOURS = 24    # a new account's first read goes back this far, no further
+OVERLAP_MINUTES = 15      # a catch-up window starts this much before the last one ended
 MAX_CATCHUP_HOURS = 72    # after failed runs, re-read at most this far back
 HANDLES_PER_QUERY = 15    # X search takes ~22 operators: 15 from: + since/until/2 filters
 GROUP_TOLERANCE_MINUTES = 60  # accounts whose Last Scraped are this close share a query
@@ -388,19 +396,22 @@ def last_end(account, now_dt):
 
 
 def window_start(accounts, now_dt):
-    """Unix start of the fetch window for a batch: the oldest of its accounts' last window ends
-    (so a failed run's gap gets re-read), minus OVERLAP_MINUTES. Accounts without a recent
-    window don't pull it back; if none has one, start RUN_HOURS back. No backfill either way."""
+    """Unix start of the fetch window for a batch: WINDOW_HOURS back, or the oldest of its
+    accounts' last window ends minus OVERLAP_MINUTES if that's earlier (so a failed run's gap
+    gets re-read). A batch of new accounts (none has a recent window) starts
+    NEW_ACCOUNT_HOURS back."""
     ends = [e for e in (last_end(a, now_dt) for a in accounts) if e]
-    start = min(ends) if ends else now_dt - timedelta(hours=RUN_HOURS)
-    return int((start - timedelta(minutes=OVERLAP_MINUTES)).timestamp())
+    if not ends:
+        return int((now_dt - timedelta(hours=NEW_ACCOUNT_HOURS)).timestamp())
+    start = min(min(ends) - timedelta(minutes=OVERLAP_MINUTES), now_dt - timedelta(hours=WINDOW_HOURS))
+    return int(start.timestamp())
 
 
 def group_accounts(accounts, now_dt):
     """Batches of at most HANDLES_PER_QUERY accounts whose windows end within
     GROUP_TOLERANCE_MINUTES of each other, so one account that's behind (after a failure or a
     short pause) is read in its own query instead of making the others re-read (and re-pay
-    for) its longer window. New accounts join an up-to-date batch, or get their own."""
+    for) its longer window. New accounts are batched only with each other, for their 24 hours."""
     tol = timedelta(minutes=GROUP_TOLERANCE_MINUTES)
     dated = sorted((a for a in accounts if last_end(a, now_dt)), key=lambda a: last_end(a, now_dt), reverse=True)
     groups = []
@@ -409,22 +420,12 @@ def group_accounts(accounts, now_dt):
             groups[-1].append(a)
         else:
             groups.append([a])
-
-    def up_to_date(group):
-        ends = [e for e in (last_end(a, now_dt) for a in group) if e]
-        return not ends or min(ends) >= now_dt - timedelta(hours=RUN_HOURS) - tol
-
-    for a in (a for a in accounts if not last_end(a, now_dt)):
-        group = next((g for g in groups if len(g) < HANDLES_PER_QUERY and up_to_date(g)), None)
-        if group is None:
-            group = []
-            groups.append(group)
-        group.append(a)
-    return groups
+    new = [a for a in accounts if not last_end(a, now_dt)]
+    return groups + [new[i:i + HANDLES_PER_QUERY] for i in range(0, len(new), HANDLES_PER_QUERY)]
 
 
 def slices(since, until):
-    """[start, end) pieces of at most SLICE_HOURS, oldest first. A normal 6-hour window is one."""
+    """[start, end) pieces of at most SLICE_HOURS, oldest first. A normal 8-hour window is one."""
     out, step = [], SLICE_HOURS * 3600
     while since < until:
         out.append((since, min(until, since + step)))
@@ -546,13 +547,15 @@ def scrape_batch(accounts, known, now):
     """Read and save one batch's window, slice by slice (oldest first). Returns (per-account
     stats, batch stats, problems for every account in the batch, Platform ID updates).
     batch["covered"] is the end of the last slice fully read and saved (None if none was):
-    Last Scraped may move there, never past anything unread."""
+    Last Scraped may move there, never past anything unread. For new accounts it starts at the
+    window start, so if their first read fails the next run still reads their full 24 hours."""
     now_dt = parse_iso(now)
     since, until = window_start(accounts, now_dt), int(now_dt.timestamp())
     handles = [valid_handle(a) for a in accounts]
     per = {a["id"]: new_stats() for a in accounts}
+    new = not any(last_end(a, now_dt) for a in accounts)
     batch = {"since": iso(datetime.fromtimestamp(since, timezone.utc)), "returned": 0, "skipped": 0,
-             "unmatched": 0, "calls": 0, "credits": 0, "covered": None, "backlog": None}
+             "unmatched": 0, "calls": 0, "credits": 0, "covered": since if new else None, "backlog": None}
     log(f"  Window {batch['since']} -> {now} for {', '.join(handles)}")
     problems, pid_updates = [], {}
     budget = {"calls": MAX_CALLS_PER_BATCH}
@@ -598,17 +601,22 @@ def scrape_batch(accounts, known, now):
     return per, batch, problems, pid_updates
 
 
-def main():
+def main(new_accounts=False):
+    """new_accounts: read only the accounts with no recent Last Scraped (just added)."""
     load_env()
     started = datetime.now(timezone.utc)
-    log("X scrape started")
+    log("X scrape started" + (" (new accounts only)" if new_accounts else ""))
 
     accounts = [
         a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_PLATFORM_ID, A_HANDLE, A_SCRAPE,
                                            A_LAST_SCRAPED, A_LAST_STATUS])
         if a["fields"].get(A_SCRAPE) == "Active" and a["fields"].get(A_PLATFORM) == "X"
     ]
-    log(f"{len(accounts)} active X account(s)")
+    if new_accounts:
+        accounts = [a for a in accounts if not last_end(a, started)]
+        log(f"{len(accounts)} new X account(s)")
+    else:
+        log(f"{len(accounts)} active X account(s)")
 
     known = {}  # tweet ID -> {"id", "media"} (None = not in Airtable), filled per read
     valid = [a for a in accounts if valid_handle(a)]
@@ -681,8 +689,11 @@ def acquire_lock():
 
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args not in ([], ["--new-accounts"]):
+        sys.exit("Usage: x.py [--new-accounts]")
     lock = acquire_lock()
     if lock is None:
         print("Another x.py run is in progress; exiting.")
         sys.exit(0)
-    sys.exit(main())
+    sys.exit(main(new_accounts=bool(args)))

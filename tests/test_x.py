@@ -38,6 +38,8 @@ def acc(rec, handle, pid, last=None, status="never", scrape="Active", platform="
 
 
 EP = acc("recEP", "example_user", EP_ID)
+prev = NOW - H6
+EP_OK = acc("recEP", "example_user", EP_ID, iso(prev), "ok")  # read up to the previous run
 passed = failed = 0
 
 
@@ -122,11 +124,11 @@ class FakeAT:
         return {r["id"]: r["fields"] for m, t, b in self.writes if t == x.ACCOUNTS for r in b["records"]}
 
 
-def run(tw, at):
+def run(tw, at, new_accounts=False):
     x.twitterapi, x.airtable = tw, at
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = x.main()
+        code = x.main(new_accounts=new_accounts)
     return code, buf.getvalue()
 
 
@@ -147,16 +149,17 @@ def tweet(tid, author_id, handle, created, **kw):
     return t
 
 
-# 1. New account, real sample: query shape, last 6 hours (+15 min), mapping, quotes skipped
+# 1. New account, real sample: query shape, last 24 hours, mapping, quotes skipped
 tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([EP])
 code, out = run(tw, at)
-since, until = q_times(tw.params[0])
+since, until = q_times(tw.params[0])[0], q_times(tw.params[-1])[1]
 check("exit 0", code == 0)
 check("query shape", tw.params[0]["query"].startswith("(from:example_user) since_time:")
       and tw.params[0]["query"].endswith("-filter:replies -filter:retweets") and tw.params[0]["queryType"] == "Latest")
 check("cursor only from page 2", "cursor" not in tw.params[0] and tw.params[1]["cursor"] == SAMPLE["next_cursor"])
 check("until = moment of execution", until == int(NOW.timestamp()))
-check("new account: no backfill, window = 6h + 15 min", until - since == 6 * 3600 + 15 * 60)
+check("new account: last 24 hours exactly, in 3 slices", until - since == 24 * 3600
+      and len({q_times(p) for p in tw.params}) == 3)
 posts = at.posted()
 check("#8 quote tweets skipped, 2 originals created", len(posts) == 2 and "2 quote/reply/retweet skipped" in out
       and not {q["id"] for q in quotes} & {r["fields"][x.P_TWEET_ID] for r in posts})
@@ -168,7 +171,7 @@ check("linked, Status New, html unescaped", c[x.P_ACCOUNT] == ["recEP"] and c[x.
 u = at.account_updates()["recEP"]
 check("success: Last Scraped = run time, ok", u[x.A_LAST_SCRAPED] == iso(NOW) and u[x.A_LAST_STATUS] == "ok")
 check("#7 success clears Scrape Error (sends null)", x.A_SCRAPE_ERROR in u and u[x.A_SCRAPE_ERROR] is None)
-check("est credits 75 (4 tweets + empty page)", "est. credits 75" in out)
+check("est credits 105 (4 tweets + 3 empty pages)", "est. credits 105" in out)
 
 # 2. #4 Only the returned Tweet IDs are looked up; the table is never loaded
 check("#4 X Posts table not loaded", at.full_loads == 0)
@@ -189,12 +192,13 @@ check("#4 quote in lookup formula escaped", "\\'" in "{%s}='%s'" % (x.P_TWEET_ID
 # 3. Window rules
 def ws(accounts):
     return x.window_start(accounts, NOW)
-prev = NOW - H6
-check("window: previous run end - 15 min", ws([acc("a", "a", "1", iso(prev), "ok")]) == int((prev - M15).timestamp()))
+H8, H24 = timedelta(hours=8), timedelta(hours=24)
+check("window: on schedule, last 8 hours", ws([acc("a", "a", "1", iso(prev), "ok")]) == int((NOW - H8).timestamp()))
+check("window: run 7h45m after the last, still 8 hours", ws([acc("a", "a", "1", iso(NOW - timedelta(hours=7, minutes=45)), "ok")]) == int((NOW - H8).timestamp()))
 check("window: after a failure, gap re-read", ws([acc("a", "a", "1", iso(NOW - 2 * H6), "error")]) == int((NOW - 2 * H6 - M15).timestamp()))
-check("window: new account joins (no backfill)", ws([acc("a", "a", "1", iso(prev), "ok"), acc("b", "b", "2")]) == int((prev - M15).timestamp()))
-check("window: stale (>72h) ignored", ws([acc("b", "b", "2", iso(NOW - timedelta(days=10)), "ok")]) == int((NOW - H6 - M15).timestamp()))
-check("window: future Last Scraped ignored", ws([acc("a", "a", "1", iso(NOW + H6), "ok")]) == int((NOW - H6 - M15).timestamp()))
+check("window: new accounts, last 24 hours", ws([acc("b", "b", "2"), acc("c", "c", "3")]) == int((NOW - H24).timestamp()))
+check("window: stale (>72h) = new, last 24 hours", ws([acc("b", "b", "2", iso(NOW - timedelta(days=10)), "ok")]) == int((NOW - H24).timestamp()))
+check("window: future Last Scraped = new", ws([acc("a", "a", "1", iso(NOW + H6), "ok")]) == int((NOW - H24).timestamp()))
 
 # 4. #2 Grouping: one account behind doesn't rewind the others
 g = x.group_accounts([acc(f"r{i}", f"u{i}", str(i), iso(prev), "ok") for i in range(5)]
@@ -203,18 +207,20 @@ check("#2 account behind gets its own query", len(g) == 2 and [a["id"] for a in 
 g = x.group_accounts([acc(f"r{i}", f"u{i}", str(i), iso(prev + timedelta(minutes=i)), "ok") for i in range(20)], NOW)
 check("#2 20 up-to-date accounts -> 15 + 5", [len(b) for b in g] == [15, 5])
 g = x.group_accounts([acc("r0", "u0", "0", iso(prev), "ok"), acc("rNew", "new", "5")], NOW)
-check("#2 new account joins an up-to-date batch", len(g) == 1 and len(g[0]) == 2)
+check("#2 new account gets its own batch (its 24h, not 8h)", len(g) == 2 and [a["id"] for a in g[1]] == ["rNew"])
+g = x.group_accounts([acc(f"rN{i}", f"n{i}", str(i)) for i in range(20)], NOW)
+check("#2 20 new accounts -> 15 + 5", [len(b) for b in g] == [15, 5])
 g = x.group_accounts([acc("rLate", "late", "99", iso(NOW - 4 * H6), "error"), acc("rNew", "new", "5")], NOW)
 check("#2 new account never joins a catching-up batch (no backfill)", len(g) == 2 and [a["id"] for a in g[1]] == ["rNew"])
 accs = [acc(f"r{i}", f"u{i}", str(1000 + i), iso(prev), "ok") for i in range(3)] + [acc("rLate", "late", "999", iso(NOW - 4 * H6), "error")]
 tw, at = WorldTW([]), FakeAT(accs)
 run(tw, at)
 qs = [(p["query"].count("from:"), until - since) for p in tw.params for since, until in [q_times(p)]]
-check("#2 end to end: up-to-date batch reads 6h, the late one reads its own 24h",
-      qs[0] == (3, 6 * 3600 + 15 * 60) and all(n == 1 for n, _ in qs[1:]) and sum(d for _, d in qs[1:]) == 24 * 3600 + 15 * 60)
+check("#2 end to end: up-to-date batch reads 8h, the late one reads its own 24h",
+      qs[0] == (3, 8 * 3600) and all(n == 1 for n, _ in qs[1:]) and sum(d for _, d in qs[1:]) == 24 * 3600 + 15 * 60)
 
 # 5. #1 Slices and the page cap: nothing unread is ever skipped, nothing paid twice
-check("slices: 6h15m is one slice", x.slices(0, 6 * 3600 + 900) == [(0, 6 * 3600 + 900)])
+check("slices: 8h is one slice", x.slices(0, 8 * 3600) == [(0, 8 * 3600)])
 check("slices: 30h -> 8+8+8+6", [b - a for a, b in x.slices(0, 30 * 3600)] == [8 * 3600] * 3 + [6 * 3600])
 late = acc("recEP", "example_user", EP_ID, iso(NOW - 5 * H6), "error")  # 30h behind
 busy = [tweet(str(80000 + i), EP_ID, "example_user", NOW - timedelta(minutes=5 * i + 1)) for i in range(350)]  # 350 in ~29h
@@ -252,11 +258,11 @@ check("#1 budget: later runs finish the catch-up, nothing lost", all(t["id"] in 
 
 # 6. #5 One retry on twitterapi.io 429 / 5xx / network errors
 SLEEPS.clear()
-tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={1: x.HttpError("HTTP 500 from /twitter: oops", 500)}), FakeAT([EP])
+tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={1: x.HttpError("HTTP 500 from /twitter: oops", 500)}), FakeAT([EP_OK])
 code, out = run(tw, at)
 check("#5 500 then ok: retried once, saved, ok", code == 0 and tw.calls == 3 and len(at.posted()) == 2 and SLEEPS == [x.RETRY_WAIT_SECONDS])
 SLEEPS.clear()
-tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={1: x.HttpError("HTTP 429 from /twitter: slow down", 429, "7")}), FakeAT([EP])
+tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={1: x.HttpError("HTTP 429 from /twitter: slow down", 429, "7")}), FakeAT([EP_OK])
 run(tw, at)
 check("#5 429 honours Retry-After", SLEEPS == [7] and len(at.posted()) == 2)
 SLEEPS.clear()
@@ -265,11 +271,11 @@ code, out = run(tw, at)
 u = at.account_updates()["recEP"]
 check("#5 fails twice: error, Last Scraped kept, exit 1", code == 1 and tw.calls == 2 and x.A_LAST_SCRAPED not in u and u[x.A_LAST_STATUS] == "error")
 SLEEPS.clear()
-tw, at = FakeTW([SAMPLE], fail={1: x.HttpError("HTTP 401 from /twitter: bad key", 401)}), FakeAT([EP])
+tw, at = FakeTW([SAMPLE], fail={1: x.HttpError("HTTP 401 from /twitter: bad key", 401)}), FakeAT([EP_OK])
 code, out = run(tw, at)
 check("#5 401 not retried", tw.calls == 1 and SLEEPS == [] and code == 1)
 SLEEPS.clear()
-tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={2: x.HttpError("HTTP 502 from /twitter: bad gateway", 502)}), FakeAT([EP])
+tw, at = FakeTW([SAMPLE, SAMPLE, EMPTY], fail={2: x.HttpError("HTTP 502 from /twitter: bad gateway", 502)}), FakeAT([EP_OK])
 code, out = run(tw, at)
 check("#5 later page retried too", code == 0 and SLEEPS == [x.RETRY_WAIT_SECONDS])
 SLEEPS.clear()
@@ -329,7 +335,7 @@ x.twitterapi = FakeTW([{"tweets": twelve, "has_next_page": True, "next_cursor": 
 tws, calls, _, inc = x.fetch_tweets(["example_user"], 0, 1)
 check("repeated page stops", calls == 2 and len(tws) == 12)
 bad_handle, paused, yt = acc("recBAD", "not a handle!", "7"), acc("recP", "paused1", "8", scrape="Paused"), acc("recYT", "someone", "9", platform="YouTube")
-tw, at = FakeTW([EMPTY]), FakeAT([EP, bad_handle, paused, yt])
+tw, at = FakeTW([EMPTY]), FakeAT([EP_OK, bad_handle, paused, yt])
 code, out = run(tw, at)
 ups = at.account_updates()
 check("invalid handle flagged, not queried", ups["recBAD"][x.A_LAST_STATUS] == "error" and "not a handle" not in tw.params[0]["query"])
@@ -338,7 +344,41 @@ check("empty window: 1 call, ok", tw.calls == 1 and ups["recEP"][x.A_LAST_STATUS
 t = copy.deepcopy(originals[0]); t["text"] = "a" * 150000
 check("text capped at 100k", len(x.post_fields(t, "r", iso(NOW))[x.P_TEXT]) == 100000)
 
-# 9. #6 Single-flight lock
+# 9. --new-accounts: the run started by the Airtable automation when an X account is added
+SLEEPS.clear()
+old_acc = acc("recOLD", "old_user", "77", iso(prev), "ok")
+stale = acc("recSTALE", "back_user", "78", iso(NOW - timedelta(days=10)), "ok")
+fresh = [tweet("n1", EP_ID, "example_user", NOW - timedelta(hours=23)), tweet("n2", EP_ID, "example_user", NOW - timedelta(hours=1)),
+         tweet("n0", EP_ID, "example_user", NOW - timedelta(hours=25)), tweet("o1", "77", "old_user", NOW - timedelta(hours=1))]
+tw, at = WorldTW(fresh), FakeAT([old_acc, EP, stale, acc("recP", "paused1", "8", scrape="Paused")])
+code, out = run(tw, at, new_accounts=True)
+ups = at.account_updates()
+check("new-accounts: only new (and >72h stale) accounts read, in one batch", code == 0
+      and all("old_user" not in p["query"] and "paused1" not in p["query"] for p in tw.params)
+      and all("example_user" in p["query"] and "back_user" in p["query"] for p in tw.params))
+check("new-accounts: last 24 hours only", {r["fields"][x.P_TWEET_ID] for r in at.posted()} == {"n1", "n2"}
+      and q_times(tw.params[0])[0] == int((NOW - timedelta(hours=24)).timestamp()))
+check("new-accounts: Last Scraped = run time; other accounts untouched", set(ups) == {"recEP", "recSTALE"}
+      and ups["recEP"][x.A_LAST_SCRAPED] == iso(NOW) and ups["recEP"][x.A_LAST_STATUS] == "ok")
+tw, at = WorldTW(fresh), FakeAT([old_acc, acc("recP", "paused1", "8", scrape="Paused")])
+code, out = run(tw, at, new_accounts=True)
+check("new-accounts: none new -> no calls, no writes, exit 0", code == 0 and tw.calls == 0 and not at.writes)
+tw, at = WorldTW(fresh, fail={1: x.HttpError("HTTP 500", 500), 2: x.HttpError("HTTP 500", 500)}), FakeAT([EP])
+code, out = run(tw, at, new_accounts=True)
+u = at.account_updates()["recEP"]
+check("new-accounts: first read fails -> error, Last Scraped = 24h back", code == 1 and u[x.A_LAST_STATUS] == "error"
+      and u[x.A_LAST_SCRAPED] == iso(NOW - timedelta(hours=24)))
+at.accounts[0]["fields"].update(u)
+tw = WorldTW(fresh); at.writes.clear()
+code, out = run(tw, at)
+check("new-accounts: next scheduled run reads the full 24h", code == 0 and {r["fields"][x.P_TWEET_ID] for r in at.posted()} == {"n1", "n2"}
+      and q_times(tw.params[0])[0] == int((NOW - timedelta(hours=24) - M15).timestamp()))
+at.accounts[0]["fields"].update(at.account_updates()["recEP"])
+tw = WorldTW(fresh)
+code, out = run(tw, at, new_accounts=True)
+check("new-accounts: once read, a later webhook run skips it", code == 0 and tw.calls == 0)
+
+# 10. #6 Single-flight lock
 x.LOCK_FILE = x.Path(os.environ.get("TMPDIR", "/tmp")) / "x_scrape_test.lock"
 first = x.acquire_lock()
 second = x.acquire_lock()

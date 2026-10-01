@@ -4,8 +4,10 @@ and at least 15 per call, since_time inclusive / until_time exclusive, (from:a O
 
 Each scenario runs x.main() on GitHub's 6-hour schedule (runs start 0-30 minutes late, and
 about 3% are skipped, as GitHub's scheduler does under load) for DAYS days
-over a set of accounts and checks: no missed original tweets, no duplicates, no backfill,
-Reviewed marks kept, and credit usage.
+over a set of accounts and checks: no missed original tweets, no duplicates, nothing read from
+before a new account's last 24 hours, Reviewed marks kept, and credit usage. The webhook
+scenarios also run x.main(new_accounts=True) when an account is added, as the Airtable
+automation does, and check it leaves the other accounts alone.
 Run: python3 tests/stress_x.py
 """
 import copy, io, contextlib, os, random, re, statistics, sys
@@ -122,9 +124,10 @@ class FakeAirtable:
 
 def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write_fail=0.0,
              api_outage=None, airtable_outage=None, added_day=None, paused=None, late_share=0.0,
-             quote_share=0.3, broken=None):
+             quote_share=0.3, broken=None, webhook=False):
     """rates: tweets/day (originals + quotes) per account. added_day: {index: day added}.
-    paused: (index, from_day, to_day)."""
+    paused: (index, from_day, to_day). webhook: an account added after the start is added
+    1-5 hours before a scheduled run and read right away with x.main(new_accounts=True)."""
     rnd = random.Random(seed)
     specs = [(f"acct{i}", str(5000 + i), r) for i, r in enumerate(rates)]
     world = make_world(specs, days, rnd, quote_share=quote_share, late_share=late_share)
@@ -136,18 +139,28 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
     at.p_write_fail = p_write_fail
     x.twitterapi, x.airtable = tw, at
 
-    first_run_at, per_run, errors, reviewed = {}, [], 0, set()
+    first_run_at, per_run, errors, reviewed, webhook_touched = {}, [], 0, set(), 0
     runs = days * 4 + 1
     for i in range(runs):
         day = i / 4
         SIM["now"] = T0 + timedelta(hours=6 * i, minutes=rnd.uniform(0, 30))  # GitHub schedule delay
         if 0 < i < runs - 1 and rnd.random() < 0.03:
             continue  # GitHub skipped this scheduled run
+        scheduled_at, before, added = SIM["now"], tw.credits, False
+        if webhook and i > 0:
+            SIM["now"] = scheduled_at - timedelta(hours=rnd.uniform(1, 5))
         for j, (h, aid, _) in enumerate(specs):
             if j not in first_run_at and day >= added_day.get(j, 0):
                 accounts.append({"id": f"acc{j}", "fields": {x.A_NAME: h, x.A_PLATFORM: "X", x.A_PLATFORM_ID: aid,
                                                              x.A_HANDLE: h, x.A_SCRAPE: "Active", x.A_LAST_STATUS: "never"}})
                 first_run_at[j] = SIM["now"]
+                added = True
+        if added and SIM["now"] != scheduled_at:  # the Airtable automation starts the new-account run
+            others = {a["id"]: copy.deepcopy(a["fields"]) for a in accounts if a["fields"].get(x.A_LAST_SCRAPED)}
+            with contextlib.redirect_stdout(io.StringIO()):
+                errors += x.main(new_accounts=True)
+            webhook_touched += sum(a["fields"] != others[a["id"]] for a in accounts if a["id"] in others)
+        SIM["now"] = scheduled_at
         if paused:
             j, a, b = paused
             acct = next(a_ for a_ in accounts if a_["id"] == f"acc{j}")
@@ -158,7 +171,6 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
             acct["fields"][x.A_HANDLE] = "broken handle!" if a <= day < b else specs[j][0]
         tw.down = bool(api_outage and api_outage[0] <= day < api_outage[1])
         at.down = bool(airtable_outage and airtable_outage[0] <= day < airtable_outage[1])
-        before = tw.credits
         with contextlib.redirect_stdout(io.StringIO()):
             errors += x.main()
         per_run.append(tw.credits - before)
@@ -173,12 +185,14 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
     expected, late_missed, backfilled, pause_gap = set(), 0, 0, 0
     for t in world:
         j = int(t["handle"][4:])
-        start = first_run_at[j] - timedelta(hours=x.RUN_HOURS)
+        start = first_run_at[j] - timedelta(hours=x.NEW_ACCOUNT_HOURS)  # a new account's last 24h
         if t["kind"] != "orig":
             continue
         if t["created"] < start - overlap:
             backfilled += t["id"] in stored_set
             continue
+        if t["created"] < start:
+            continue  # within the overlap before a new account's 24h: may or may not be read
         if t["created"] >= last_run - timedelta(minutes=10):
             continue  # posted after the final run's cut-off
         if paused and j == paused[0] and T0 + timedelta(days=paused[1]) - timedelta(hours=6) <= t["created"] < T0 + timedelta(days=paused[2]) - timedelta(hours=6):
@@ -197,7 +211,8 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
             "quotes": sum(1 for t in world if t["kind"] == "quote" and t["id"] in stored_set),
             "run_min": min(steady), "run_med": statistics.median(steady), "run_max": max(steady),
             "calls_per_run": tw.calls / runs, "per_month": per_month, "accounts": len(rates),
-            "max_handles": tw.max_handles, "error_runs": errors, "full_loads": at.full_loads}
+            "max_handles": tw.max_handles, "error_runs": errors, "full_loads": at.full_loads,
+            "webhook_touched": webhook_touched}
 
 
 FAILURES = []
@@ -206,7 +221,8 @@ FAILURES = []
 def show(name, r, loss_expected=False):
     """Print one scenario; record it as failed if it lost, duplicated or backfilled tweets
     (a lost tweet is only allowed where the scenario is a known limit)."""
-    if r["dupes"] or r["backfilled"] or r["lost_review"] or r["full_loads"] or (r["missed"] and not loss_expected):
+    if (r["dupes"] or r["backfilled"] or r["lost_review"] or r["full_loads"] or r["webhook_touched"]
+            or (r["missed"] and not loss_expected)):
         FAILURES.append(name)
     pm = r["per_month"]
     print(f"{name:<46} missed {r['missed']:>3}/{r['expected']:<5} dupes {r['dupes']} backfilled {r['backfilled']} "
@@ -233,6 +249,10 @@ if __name__ == "__main__":
     show("6x3/day, twitterapi.io down 4 days (>72h cap)", simulate([3] * 6, api_outage=(10, 14)), loss_expected=True)
     print("\n== Accounts added / paused ==")
     show("6x3/day, account 5 added on day 12", simulate([3] * 6, added_day={5: 12}))
+    show("6x3/day, account 5 added day 12, webhook", simulate([3] * 6, added_day={5: 12}, webhook=True))
+    show("20x3/day, 10 added over days 3-20, webhook", simulate([3] * 20, added_day={j: 3 + (j - 10) * 1.75 for j in range(10, 20)}, webhook=True))
+    show("20x3/day, added via webhook, 10% failures", simulate([3] * 20, added_day={j: 3 + (j - 10) * 1.75 for j in range(10, 20)},
+                                                              webhook=True, p_first_fail=0.1, p_later_fail=0.1, p_write_fail=0.05))
     show("6x3/day, account 2 paused days 5-15", simulate([3] * 6, paused=(2, 5, 15)))
     show("6x3/day, account 2 paused days 5-6 (1 day)", simulate([3] * 6, paused=(2, 5, 6)))
     show("6x3/day, one account broken 2 days (grouping)", simulate([3] * 6, broken=(3, 10, 12)))

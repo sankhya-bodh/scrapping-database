@@ -1,0 +1,31 @@
+name: X new account
+
+# Started by the Airtable automation when an X account is added (see README, "New X accounts"),
+# or by hand from the Actions tab. Reads only the accounts with no Last Scraped yet: their last
+# 24 hours of tweets, then sets Last Scraped. Does nothing (no credits) if there are none.
+on:
+  workflow_dispatch:
+
+# Shares the scheduled scraper's group, so the two never run at once and create the same tweets.
+# If a scheduled run is waiting when this starts, GitHub may drop it; the next one re-reads the gap.
+concurrency:
+  group: x-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scrape new X accounts
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          TWITTER_API: ${{ secrets.TWITTER_API }}
+        run: python3 scripts/x.py --new-accounts
