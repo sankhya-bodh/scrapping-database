@@ -1,0 +1,57 @@
+name: YouTube new account
+
+# Started by the Airtable automation when the form adds a YouTube channel (see README,
+# "New accounts"), with that row's record ID, or by hand from the Actions tab.
+#   1. setup: fills the row from its Profile URL (ScrapeCreators channel, 1 credit) and sets
+#      Scrape = Active. Skipped when no record ID is given.
+#   2. scrape: reads every channel with no Last Scraped yet (1 credit each), stores its videos
+#      from the last 3 days, then sets Last Scraped. No calls if there are none.
+on:
+  workflow_dispatch:
+    inputs:
+      record_id:
+        description: "Accounts record ID (recXXXXXXXXXXXXXX) of the new YouTube channel"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    if: inputs.record_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Fill the channel from its Profile URL
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          SCRAPE_CREATORS: ${{ secrets.SCRAPE_CREATORS }}
+          RECORD_ID: ${{ inputs.record_id }}
+        run: python3 scripts/youtube_profile.py "$RECORD_ID"
+
+  scrape:
+    needs: setup
+    # Runs after a successful setup, or on its own when no record ID was given.
+    if: ${{ !failure() && !cancelled() }}
+    # Shares the daily scraper's group so the two never store the same video twice. Only this
+    # job is in it: setup always runs, so a new channel is never skipped.
+    concurrency:
+      group: youtube-scrape
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scrape new YouTube channels (last 3 days)
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          SCRAPE_CREATORS: ${{ secrets.SCRAPE_CREATORS }}
+        run: python3 scripts/youtube.py --new-accounts

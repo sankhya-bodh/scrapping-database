@@ -21,6 +21,8 @@ jobs:
         run: python3 tests/test_x.py
       - name: New account setup tests
         run: python3 tests/test_x_profile.py
+      - name: YouTube tests
+        run: python3 tests/test_youtube.py
       - name: Malformed data
         run: python3 tests/fuzz_x.py
       - name: 30-day simulations

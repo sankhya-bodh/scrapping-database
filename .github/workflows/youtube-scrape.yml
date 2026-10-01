@@ -1,0 +1,34 @@
+name: YouTube scrape
+
+# Runs daily on GitHub's own schedule, or by hand from the Actions tab. Each active YouTube
+# channel is scraped every 3 days (3 days after its Last Scraped), so on most days only some
+# channels are read, and on days none is due no credits are used. A failed channel keeps its
+# Last Scraped and is retried the next day.
+# 03:37 UTC = 09:07 IST. Not on the hour: GitHub delays scheduled runs most at the top of the hour.
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+# One YouTube run at a time, shared with youtube-new-account.yml.
+concurrency:
+  group: youtube-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scrape YouTube
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          SCRAPE_CREATORS: ${{ secrets.SCRAPE_CREATORS }}
+        run: python3 scripts/youtube.py

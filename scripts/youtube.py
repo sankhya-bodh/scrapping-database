@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """YouTube scraper for the Content OS Database Airtable base.
 
-For every Accounts row with Scrape = Active and Platform = YouTube:
-  1. Fetch the channel's newest videos from ScrapeCreators (channel-videos),
-     exactly one call per channel: no retries, no fallback call.
-  2. Create new videos in YouTube Videos (Status = New) and refresh existing
-     ones (every field except Status, so "Reviewed" marks are kept).
-  3. Record Last Scraped / Last Scrape Status / Scrape Error on the account.
+Runs daily; each channel is scraped every RUN_DAYS days. For the Accounts rows with
+Scrape = Active and Platform = YouTube that are due (no Last Scraped yet, or Last Scraped
+RUN_DAYS days ago, less DUE_SLACK_HOURS so a slightly early daily run still counts):
+  1. Fetch the channel's 30 newest regular videos (no Shorts) from ScrapeCreators
+     (channel-videos, sort=latest, includeExtras=true): one call per channel, no retries.
+  2. Create the new ones in YouTube Videos (Status = New) if published since LOOKBACK_DAYS
+     before the channel's Last Scraped (a new channel: its last 3 days, no further back).
+     Refresh every returned video already stored (every field except Status, so "Reviewed"
+     marks are kept). Only the returned Video IDs are looked up in Airtable.
+  3. On success: Last Scraped = now, Last Scrape Status = ok, Scrape Error cleared. On
+     failure: error and the reason; Last Scraped is kept, so the next daily run retries.
+
+  python3 scripts/youtube.py                 daily run: the channels that are due
+  python3 scripts/youtube.py --new-accounts  only channels with no Last Scraped (just added)
 
 Runs unattended (standard library only). Keys come from ../.env or the
 environment: AIRTABLE_ACCESS_TOKEN, SCRAPE_CREATORS. See project.md.
@@ -19,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +41,7 @@ ACCOUNTS = "tbl04PJf51XEAiA8h"
 A_NAME = "fldPwDwLjGikNchgw"
 A_PLATFORM = "fldWYqll9jXSskuSC"
 A_PLATFORM_ID = "fldVaDjv7ixoxEE8N"
+A_HANDLE = "fldABp0JmnZKyiajW"
 A_SCRAPE = "flduo9Gt6GDKLEEs3"
 A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
 A_LAST_STATUS = "flduqhmL46oI0XJPo"
@@ -54,6 +63,10 @@ V_COMMENTS = "fldJ1L7ClYGut2diw"
 V_STATUS = "fld1cf4LCqxglAUGN"
 V_LAST_SCRAPED = "fldGSuB2qHERC4p5l"
 
+RUN_DAYS = 3          # each channel is scraped every 3 days
+DUE_SLACK_HOURS = 6   # a channel is due this long before its 3 days are up (daily-run jitter)
+LOOKBACK_DAYS = 3     # create videos published up to this long before the last scrape
+LOOKUP_CHUNK = 50     # Video IDs per Airtable lookup
 BATCH = 10  # Airtable's max records per write request
 
 
@@ -149,10 +162,12 @@ def scrapecreators(path, params=None):
 
 
 def fetch_videos(channel_id):
-    """One paid call. Returns (videos, credits_charged, credits_remaining)."""
+    """One paid call: the 30 newest regular videos (Shorts come back in a separate list,
+    which is ignored). Returns (videos, credits_charged, credits_remaining)."""
     data = scrapecreators("/v1/youtube/channel-videos",
-                          {"channelId": channel_id, "includeExtras": "true"})
-    return data.get("videos") or [], data.get("credits_charged"), data.get("credits_remaining")
+                          {"channelId": channel_id, "sort": "latest", "includeExtras": "true"})
+    videos = data.get("videos") if isinstance(data.get("videos"), list) else []
+    return [v for v in videos if isinstance(v, dict)], data.get("credits_charged"), data.get("credits_remaining")
 
 
 # --- Mapping --------------------------------------------------------------
@@ -177,6 +192,12 @@ def to_utc(value):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def parse_iso(value):
+    """ISO 8601 string -> aware datetime (UTC), or None."""
+    utc = to_utc(value)
+    return datetime.strptime(utc, "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc) if utc else None
 
 
 def video_fields(video, account_id, now, is_new):
@@ -206,27 +227,69 @@ def video_fields(video, account_id, now, is_new):
 
 # --- Main -----------------------------------------------------------------
 
+def is_due(account, now_dt):
+    """No Last Scraped yet (a new channel), or scraped RUN_DAYS ago (less the slack)."""
+    last = parse_iso(account["fields"].get(A_LAST_SCRAPED))
+    return last is None or last <= now_dt - timedelta(days=RUN_DAYS) + timedelta(hours=DUE_SLACK_HOURS)
+
+
+def create_since(account, now_dt):
+    """Videos published from this moment on are created: LOOKBACK_DAYS before the channel's
+    Last Scraped (a margin for premieres and videos made public late), or for a new channel
+    its last LOOKBACK_DAYS days."""
+    last = parse_iso(account["fields"].get(A_LAST_SCRAPED))
+    return min(last or now_dt, now_dt) - timedelta(days=LOOKBACK_DAYS)
+
+
+def lookup_existing(ids, existing):
+    """Add to `existing` (video ID -> record ID) the given IDs that are already in YouTube
+    Videos, LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
+    todo = [i for i in dict.fromkeys(ids) if i not in existing]
+    for i in range(0, len(todo), LOOKUP_CHUNK):
+        chunk = todo[i:i + LOOKUP_CHUNK]
+        quoted = ",".join("{%s}='%s'" % (V_VIDEO_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
+        body = {"filterByFormula": f"OR({quoted})", "fields": [V_VIDEO_ID],
+                "returnFieldsByFieldId": True, "pageSize": 100}
+        while True:
+            page = airtable("POST", f"{VIDEOS}/listRecords", body=body)
+            for r in page.get("records", []):
+                vid = r["fields"].get(V_VIDEO_ID)
+                if vid in chunk:
+                    existing[vid] = r["id"]
+            if not page.get("offset"):
+                break
+            body["offset"] = page["offset"]
+
+
 def scrape_account(account, existing, now):
     """Scrape one account; mutates `existing` (video ID -> record ID). Returns stats."""
     fields = account["fields"]
     channel_id = (fields.get(A_PLATFORM_ID) or "").strip()
     if not channel_id:
         raise ValueError("Platform ID (channelId) is empty")
+    since = create_since(account, parse_iso(now))
 
     videos, charged, remaining = fetch_videos(channel_id)
-    stats = {"created": 0, "updated": 0, "returned": len(videos),
+    stats = {"created": 0, "updated": 0, "older": 0, "returned": len(videos),
              "credits": charged, "remaining": remaining}
+    videos = [v for v in videos if isinstance(v.get("id"), str) and v["id"]]
+    lookup_existing([v["id"] for v in videos], existing)
     creates, updates, seen = [], [], set()
     for video in videos:
-        vid = video.get("id")
-        if not vid or vid in seen:
+        vid = video["id"]
+        if vid in seen:
             continue
         seen.add(vid)
         if vid in existing:
             updates.append({"id": existing[vid],
                             "fields": video_fields(video, account["id"], now, False)})
-        else:
-            creates.append({"fields": video_fields(video, account["id"], now, True)})
+            continue
+        # publishedTime is only an estimate ("3 weeks ago"); publishDate is exact.
+        published = parse_iso(video.get("publishDate")) or parse_iso(video.get("publishedTime"))
+        if published is not None and published < since:
+            stats["older"] += 1  # from before this channel was added: not stored
+            continue
+        creates.append({"fields": video_fields(video, account["id"], now, True)})
 
     try:
         stats["updated"] = len(write_batches("PATCH", VIDEOS, updates))
@@ -240,21 +303,24 @@ def scrape_account(account, existing, now):
     return stats
 
 
-def main():
+def main(new_accounts=False):
+    """new_accounts: only the channels with no Last Scraped (just added)."""
     load_env()
     started = datetime.now(timezone.utc)
-    log("YouTube scrape started")
+    log("YouTube scrape started" + (" (new accounts only)" if new_accounts else ""))
 
-    accounts = [
-        a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_PLATFORM_ID, A_SCRAPE])
+    active = [
+        a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_PLATFORM_ID, A_SCRAPE, A_LAST_SCRAPED])
         if a["fields"].get(A_SCRAPE) == "Active" and a["fields"].get(A_PLATFORM) == "YouTube"
     ]
-    log(f"{len(accounts)} active YouTube account(s)")
+    if new_accounts:
+        accounts = [a for a in active if not parse_iso(a["fields"].get(A_LAST_SCRAPED))]
+        log(f"{len(accounts)} new YouTube account(s)")
+    else:
+        accounts = [a for a in active if is_due(a, started)]
+        log(f"{len(accounts)} of {len(active)} active YouTube account(s) due (every {RUN_DAYS} days)")
 
-    existing = {r["fields"][V_VIDEO_ID]: r["id"]
-                for r in list_records(VIDEOS, [V_VIDEO_ID]) if r["fields"].get(V_VIDEO_ID)}
-    log(f"{len(existing)} video(s) already in YouTube Videos")
-
+    existing = {}  # video ID -> record ID, filled by lookups of the returned IDs
     results, remaining = [], None
     for account in accounts:
         name = account["fields"].get(A_NAME) or account["id"]
@@ -264,15 +330,18 @@ def main():
             stats = scrape_account(account, existing, now)
             status, error = "ok", None
         except Exception as e:  # no retries: record on the account and move on
-            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "returned": 0,
+            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "older": 0, "returned": 0,
                                                   "credits": None, "remaining": None}
             status, error = "error", f"{now} {type(e).__name__}: {e}"[:5000]
             log(f"  ERROR: {error}")
         remaining = stats["remaining"] if stats["remaining"] is not None else remaining
 
+        # Last Scraped only moves on success, so a failed channel stays due and is retried.
+        update = {A_LAST_STATUS: status, A_SCRAPE_ERROR: error}
+        if status == "ok":
+            update[A_LAST_SCRAPED] = now
         try:
-            airtable("PATCH", ACCOUNTS, body={"records": [{"id": account["id"], "fields": {
-                A_LAST_SCRAPED: now, A_LAST_STATUS: status, A_SCRAPE_ERROR: error}}]})
+            airtable("PATCH", ACCOUNTS, body={"records": [{"id": account["id"], "fields": update}]})
         except HttpError as e:
             log(f"  Could not update account row: {e}")
 
@@ -282,8 +351,8 @@ def main():
     print("Summary")
     for name, status, stats, error in results:
         used = stats["credits"] if stats["credits"] is not None else 0
-        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']}"
-              f" (of {stats['returned']} returned) | credits used {used}")
+        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']},"
+              f" {stats['older']} older not stored (of {stats['returned']} returned) | credits used {used}")
         if error:
             print(f"    error: {error}")
     total = sum(s["credits"] or 0 for _, _, s, _ in results)
@@ -294,4 +363,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    args = sys.argv[1:]
+    if args not in ([], ["--new-accounts"]):
+        sys.exit("Usage: youtube.py [--new-accounts]")
+    sys.exit(main(new_accounts=bool(args)))
