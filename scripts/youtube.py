@@ -9,7 +9,9 @@ RUN_DAYS days ago, less DUE_SLACK_HOURS so a slightly early daily run still coun
   2. Create the new ones in YouTube Videos (Status = New) if published since LOOKBACK_DAYS
      before the channel's Last Scraped (a new channel: its last 3 days, no further back).
      Refresh every returned video already stored (every field except Status, so "Reviewed"
-     marks are kept). Only the returned Video IDs are looked up in Airtable.
+     marks are kept). Only the returned Video IDs are looked up in Airtable. The thumbnail
+     is saved as an attachment (Thumbnail), only when that field is empty, so it's never
+     duplicated.
   3. On success: Last Scraped = now, Last Scrape Status = ok, Scrape Error cleared. On
      failure: error and the reason; Last Scraped is kept, so the next daily run retries.
 
@@ -53,7 +55,8 @@ V_TITLE = "fld0lhAm41ZN8FNY6"
 V_VIDEO_ID = "fldHbJmqwmwpzRqNy"
 V_ACCOUNT = "fldLyiD9EOEM7JHrx"
 V_URL = "fldPR4PqR4NsKru51"
-V_THUMBNAIL = "fld0qq4zJ1dTzJqtL"
+V_THUMBNAIL_URL = "fld0qq4zJ1dTzJqtL"  # old URL field, no longer written (Thumbnail replaces it)
+V_THUMBNAIL = "fldMcTtnax9Um4VWr"      # attachment
 V_DESCRIPTION = "fldDFQKkhZon4n068"
 V_PUBLISHED = "fldGXBPbOBna0Ww9c"
 V_DURATION = "fldPx3oe0AKQiD6iF"
@@ -208,7 +211,6 @@ def video_fields(video, account_id, now, is_new):
         V_VIDEO_ID: video.get("id"),
         V_ACCOUNT: [account_id],
         V_URL: video.get("url"),
-        V_THUMBNAIL: video.get("thumbnail"),
         V_DESCRIPTION: video.get("description"),
         # publishedTime is only day-accurate ("3 days ago"); use it for new videos when
         # publishDate is missing, but never let it overwrite an exact date on an update.
@@ -241,28 +243,37 @@ def create_since(account, now_dt):
     return min(last or now_dt, now_dt) - timedelta(days=LOOKBACK_DAYS)
 
 
+def thumbnail_files(video):
+    """Attachment list for the Thumbnail field (Airtable copies the image from the URL)."""
+    url = video.get("thumbnail")
+    if isinstance(url, str) and url.startswith("http"):
+        return [{"url": url, "filename": f"{video['id']}.jpg"}]
+    return []
+
+
 def lookup_existing(ids, existing):
-    """Add to `existing` (video ID -> record ID) the given IDs that are already in YouTube
+    """Add to `existing` (video ID -> {"id", "thumb"}) the given IDs that are already in YouTube
     Videos, LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
     todo = [i for i in dict.fromkeys(ids) if i not in existing]
     for i in range(0, len(todo), LOOKUP_CHUNK):
         chunk = todo[i:i + LOOKUP_CHUNK]
         quoted = ",".join("{%s}='%s'" % (V_VIDEO_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
-        body = {"filterByFormula": f"OR({quoted})", "fields": [V_VIDEO_ID],
+        body = {"filterByFormula": f"OR({quoted})", "fields": [V_VIDEO_ID, V_THUMBNAIL],
                 "returnFieldsByFieldId": True, "pageSize": 100}
         while True:
             page = airtable("POST", f"{VIDEOS}/listRecords", body=body)
             for r in page.get("records", []):
                 vid = r["fields"].get(V_VIDEO_ID)
                 if vid in chunk:
-                    existing[vid] = r["id"]
+                    # Empty attachment fields are left out of Airtable's response: presence = filled.
+                    existing[vid] = {"id": r["id"], "thumb": bool(r["fields"].get(V_THUMBNAIL))}
             if not page.get("offset"):
                 break
             body["offset"] = page["offset"]
 
 
 def scrape_account(account, existing, now):
-    """Scrape one account; mutates `existing` (video ID -> record ID). Returns stats."""
+    """Scrape one account; mutates `existing` (video ID -> {"id", "thumb"}). Returns stats."""
     fields = account["fields"]
     channel_id = (fields.get(A_PLATFORM_ID) or "").strip()
     if not channel_id:
@@ -270,7 +281,7 @@ def scrape_account(account, existing, now):
     since = create_since(account, parse_iso(now))
 
     videos, charged, remaining = fetch_videos(channel_id)
-    stats = {"created": 0, "updated": 0, "older": 0, "returned": len(videos),
+    stats = {"created": 0, "updated": 0, "older": 0, "thumbnails": 0, "returned": len(videos),
              "credits": charged, "remaining": remaining}
     videos = [v for v in videos if isinstance(v.get("id"), str) and v["id"]]
     lookup_existing([v["id"] for v in videos], existing)
@@ -280,23 +291,34 @@ def scrape_account(account, existing, now):
         if vid in seen:
             continue
         seen.add(vid)
-        if vid in existing:
-            updates.append({"id": existing[vid],
-                            "fields": video_fields(video, account["id"], now, False)})
+        info = existing.get(vid)
+        if info is not None:
+            record = {"id": info["id"], "fields": video_fields(video, account["id"], now, False)}
+            files = thumbnail_files(video)
+            if files and not info["thumb"]:  # fill an empty Thumbnail; never re-send a filled one
+                record["fields"][V_THUMBNAIL] = files
+            updates.append(record)
             continue
         # publishedTime is only an estimate ("3 weeks ago"); publishDate is exact.
         published = parse_iso(video.get("publishDate")) or parse_iso(video.get("publishedTime"))
         if published is not None and published < since:
             stats["older"] += 1  # from before this channel was added: not stored
             continue
-        creates.append({"fields": video_fields(video, account["id"], now, True)})
+        record = {"fields": video_fields(video, account["id"], now, True)}
+        files = thumbnail_files(video)
+        if files:
+            record["fields"][V_THUMBNAIL] = files
+        creates.append(record)
 
     try:
-        stats["updated"] = len(write_batches("PATCH", VIDEOS, updates))
-        created = write_batches("POST", VIDEOS, creates)
-        stats["created"] = len(created)
-        for rec in created:
-            existing[rec["fields"].get(V_VIDEO_ID)] = rec["id"]
+        for method, records, key in (("PATCH", updates, "updated"), ("POST", creates, "created")):
+            written = write_batches(method, VIDEOS, records)
+            stats[key] = len(written)
+            for sent, rec in zip(records, written):
+                vid = sent["fields"][V_VIDEO_ID]
+                info = existing.setdefault(vid, {"id": rec["id"], "thumb": False})
+                info["thumb"] = info["thumb"] or V_THUMBNAIL in sent["fields"]
+                stats["thumbnails"] += V_THUMBNAIL in sent["fields"]
     except Exception as e:
         e.stats = stats  # the scrape was paid for; keep its credit numbers in the summary
         raise
@@ -330,7 +352,7 @@ def main(new_accounts=False):
             stats = scrape_account(account, existing, now)
             status, error = "ok", None
         except Exception as e:  # no retries: record on the account and move on
-            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "older": 0, "returned": 0,
+            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "older": 0, "thumbnails": 0, "returned": 0,
                                                   "credits": None, "remaining": None}
             status, error = "error", f"{now} {type(e).__name__}: {e}"[:5000]
             log(f"  ERROR: {error}")
@@ -352,7 +374,8 @@ def main(new_accounts=False):
     for name, status, stats, error in results:
         used = stats["credits"] if stats["credits"] is not None else 0
         print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']},"
-              f" {stats['older']} older not stored (of {stats['returned']} returned) | credits used {used}")
+              f" {stats['older']} older not stored (of {stats['returned']} returned) | thumbnails saved"
+              f" {stats['thumbnails']} | credits used {used}")
         if error:
             print(f"    error: {error}")
     total = sum(s["credits"] or 0 for _, _, s, _ in results)

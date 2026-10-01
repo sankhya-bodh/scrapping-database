@@ -167,6 +167,24 @@ check("scheduled: Last Scraped = now", at.account()[yt.A_LAST_SCRAPED] == iso(NO
 code, out = run(FakeSC(vids), at)
 check("running again: no duplicates", len([v for v in at.videos if v["fields"].get(yt.V_VIDEO_ID) == "v_new"]) == 1)
 
+# 3b. Thumbnail saved as an attachment, once; the old URL field isn't written
+sc, at = FakeSC([video("t1", 1)]), FakeAT([channel_row()])
+code, out = run(sc, at)
+c = at.posted()[0]["fields"]
+check("thumbnail: attached on create, named by video ID", c.get(yt.V_THUMBNAIL) == [
+    {"url": "https://i.ytimg.com/vi/t1/hq720.jpg", "filename": "t1.jpg"}] and "thumbnails saved 1" in out)
+check("thumbnail: old Thumbnail URL field not written", yt.V_THUMBNAIL_URL not in c)
+stored = [{"id": "recT1", "fields": {yt.V_VIDEO_ID: "t1"}},
+          {"id": "recT2", "fields": {yt.V_VIDEO_ID: "t2", yt.V_THUMBNAIL: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
+sc, at = FakeSC([video("t1", 1), video("t2", 1)]), FakeAT([channel_row(last=NOW - timedelta(days=3))], stored)
+run(sc, at)
+up = {r["id"]: r["fields"] for r in at.patched()}
+check("thumbnail: empty field filled on update (backfill)", len(up["recT1"].get(yt.V_THUMBNAIL, [])) == 1)
+check("thumbnail: filled field never re-sent (no duplicates)", yt.V_THUMBNAIL not in up["recT2"])
+sc, at = FakeSC([video("t3", 1, thumbnail=None)]), FakeAT([channel_row()])
+run(sc, at)
+check("thumbnail: missing in the API -> no attachment, video still saved", len(at.posted()) == 1 and yt.V_THUMBNAIL not in at.posted()[0]["fields"])
+
 # 4. Dates: rough publishedTime only used when publishDate is missing
 check("window uses publishDate when there", yt.parse_iso(video("a", 1)["publishDate"]) == NOW - timedelta(days=1))
 sc, at = FakeSC([video("rough", 1, exact=False), video("rough_old", 60, exact=False), video("nodate", 1, exact=False, publishedTime=None)]), FakeAT([channel_row()])

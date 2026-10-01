@@ -54,6 +54,7 @@ It prints a summary per account and the estimated credits used. It exits with co
 - **One call per channel:** ScrapeCreators `channel-videos` (`sort=latest`, `includeExtras=true`, 1 credit) returns the 30 newest regular videos. Shorts come back in a separate list and are not stored.
 - **New videos** published since 3 days before the channel's last scrape are created with Status `New`. A new channel's first scrape stores its last 3 days, no further back.
 - **Existing videos** among the 30 newest get fresh views, likes and comments; Status is kept. Older videos stop being updated once they drop out of the 30 newest.
+- **Thumbnail** is saved as an image attachment (Airtable keeps its own copy), once: when a video is stored, or on the next scrape if the field is empty. The old Thumbnail URL field is no longer written.
 - **After a failure:** the channel is marked `error` with the reason and keeps its Last Scraped, so the next daily run retries it.
 - **Cost:** 1 credit per channel every 3 days (about 10 a month per channel), plus 1 when a channel is added.
 
