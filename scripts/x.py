@@ -116,7 +116,7 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-def load_env():
+def load_env(required=("AIRTABLE_ACCESS_TOKEN", "TWITTER_API")):
     env_file = ROOT / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -127,7 +127,7 @@ def load_env():
             key = key.strip().removeprefix("export ").strip()
             value = value.strip().strip('"').strip("'")
             os.environ.setdefault(key, value)
-    missing = [k for k in ("AIRTABLE_ACCESS_TOKEN", "TWITTER_API") if not os.environ.get(k)]
+    missing = [k for k in required if not os.environ.get(k)]
     if missing:
         sys.exit(f"Missing required keys: {', '.join(missing)} (set them in {env_file})")
 

@@ -9,6 +9,7 @@ Python scripts that fill an Airtable base with posts from creators and communiti
 | Script | Reads | Writes to | Schedule |
 |---|---|---|---|
 | `scripts/x.py` | Accounts with Platform = X, Scrape = Active | X Posts | every 6 hours, and when an X account is added |
+| `scripts/x_profile.py` | One new Accounts row (its Profile URL) | that row's X profile details | when an X account is added |
 | `scripts/youtube.py` | YouTube channels | YouTube Videos | every 3 days |
 | `scripts/instagram.py` | Instagram accounts | Instagram Posts | every 3 days |
 | `scripts/reddit.py` | Subreddits | Reddit Posts | weekly |
@@ -51,6 +52,7 @@ The tests are offline: twitterapi.io and Airtable are replaced with fakes, so th
 
 ```bash
 python3 tests/test_x.py     # unit tests
+python3 tests/test_x_profile.py  # new X account setup
 python3 tests/fuzz_x.py     # malformed API data
 python3 tests/stress_x.py   # 30-day simulations: missed tweets, duplicates, credit use
 ```
@@ -70,9 +72,16 @@ In a public repository, the Actions run logs are public. They show account handl
 
 ## New X accounts
 
-`.github/workflows/x-new-account.yml` runs `python3 scripts/x.py --new-accounts`. It reads only the active X accounts with no Last Scraped yet: their last 24 hours of tweets go into X Posts, and their Last Scraped, Last Scrape Status and Scrape Error are set. Other accounts are not touched. If there are no new accounts it makes no API calls.
+New X accounts come in through an Airtable form that fills only **Profile URL**, e.g. `https://x.com/eptwts`. An Airtable automation then calls a webhook with the new row's record ID, which starts `.github/workflows/x-new-account.yml`:
 
-It's started by a webhook call to GitHub's API:
+1. **Setup** (`python3 scripts/x_profile.py <record_id>`): the username is what follows `x.com/` up to the next `/` (or `?`), without `@`. `twitter.com` links and a bare username work too. It's checked (1–15 letters, digits or `_`, X's own rule) and against the existing X accounts, then loaded from ScrapeCreators (`/v1/twitter/profile`, 1 credit). The row gets Name, Platform = X, Platform ID, Handle, Profile URL, Avatar URL, Bio, Verified, Followers, Following, Last Scrape Status = never, and Scrape = Active.
+2. **Scrape** (`python3 scripts/x.py --new-accounts`): reads the last 24 hours of every account with no Last Scraped yet, then sets Last Scraped, Last Scrape Status and Scrape Error. Other accounts are not touched.
+
+If setup fails (not an X link, a username that's too long, an account that's already tracked, or one X doesn't have), the row is left with Scrape not Active, Last Scrape Status = error and the reason in Scrape Error, and the run shows red in the Actions tab. Fix the Profile URL and run the automation again (or the workflow, by hand, with the record ID). A row that already has a Platform ID is never changed, so calling the webhook twice costs nothing.
+
+If the webhook isn't called after setup, or the scrape job fails, nothing is lost: the next scheduled run reads the new account's last 24 hours instead.
+
+### The webhook
 
 ```
 POST https://api.github.com/repos/sankhya-bodh/scrapping-database/actions/workflows/x-new-account.yml/dispatches
@@ -80,19 +89,20 @@ Authorization: Bearer <GitHub token>
 Accept: application/vnd.github+json
 Content-Type: application/json
 
-{"ref": "main"}
+{"ref": "main", "inputs": {"record_id": "recXXXXXXXXXXXXXX"}}
 ```
 
-GitHub answers `204 No Content` and starts the run within a few seconds. No record ID is needed: each run reads every new account, so two accounts added together are both read even if GitHub merges the two runs.
+GitHub answers `204 No Content` and starts the run within a few seconds. The token is a fine-grained personal access token (GitHub → Settings → Developer settings → Fine-grained tokens): repository access *Only select repositories* → `scrapping-database`, permission **Actions: Read and write**, nothing else.
 
-**GitHub token:** a fine-grained personal access token (GitHub → Settings → Developer settings → Fine-grained tokens), repository access *Only select repositories* → `scrapping-database`, permission **Actions: Read and write**. Nothing else.
+### The Airtable automation
 
-**Airtable automation:**
-
-1. Trigger: *When a record matches conditions*, table Accounts: Platform is X, Scrape is Active, Handle is not empty. (Set Scrape to Active last, once the Handle is right.)
-2. Action: *Run a script*. Add a secret named `GITHUB_TOKEN` with the token, and use:
+1. Trigger: *When a form is submitted* (the X account form), or *When a record is created* on Accounts.
+2. Action: *Run a script*. Input variable `record_id` = the trigger's Airtable record ID. Secret `GITHUB_TOKEN` = the token.
 
 ```js
+const { record_id } = input.config();
+if (!/^rec[A-Za-z0-9]{14}$/.test(record_id)) throw new Error(`Not an Airtable record ID: ${record_id}`);
+
 const response = await fetch(
   'https://api.github.com/repos/sankhya-bodh/scrapping-database/actions/workflows/x-new-account.yml/dispatches',
   {
@@ -103,10 +113,9 @@ const response = await fetch(
       'X-GitHub-Api-Version': '2022-11-28',
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ ref: 'main' }),
+    body: JSON.stringify({ ref: 'main', inputs: { record_id } }),
   },
 );
 if (!response.ok) throw new Error(`GitHub returned ${response.status}: ${await response.text()}`);
+console.log(`Started the X new account run for ${record_id}`);
 ```
-
-If the webhook isn't called, or its run fails, nothing is lost: the next scheduled run reads the new account's last 24 hours instead.

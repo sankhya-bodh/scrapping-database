@@ -19,6 +19,8 @@ jobs:
           python-version: "3.12"
       - name: Unit tests
         run: python3 tests/test_x.py
+      - name: New account setup tests
+        run: python3 tests/test_x_profile.py
       - name: Malformed data
         run: python3 tests/fuzz_x.py
       - name: 30-day simulations
