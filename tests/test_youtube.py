@@ -173,7 +173,7 @@ code, out = run(sc, at)
 c = at.posted()[0]["fields"]  # the query (which makes YouTube serve AVIF) is dropped: JPEG
 check("thumbnail: attached on create, named by video ID", c.get(yt.V_THUMBNAIL) == [
     {"url": "https://i.ytimg.com/vi/t1/hq720.jpg", "filename": "t1.jpg"}] and "thumbnails saved 1" in out)
-check("thumbnail: old Thumbnail URL field not written", yt.V_THUMBNAIL_URL not in c)
+check("thumbnail: the deleted Thumbnail URL field is never written", "fld0qq4zJ1dTzJqtL" not in str(at.writes))
 stored = [{"id": "recT1", "fields": {yt.V_VIDEO_ID: "t1"}},
           {"id": "recT2", "fields": {yt.V_VIDEO_ID: "t2", yt.V_THUMBNAIL: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
 sc, at = FakeSC([video("t1", 1), video("t2", 1)]), FakeAT([channel_row(last=NOW - timedelta(days=3))], stored)
