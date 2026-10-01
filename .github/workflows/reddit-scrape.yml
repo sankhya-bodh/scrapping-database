@@ -1,0 +1,33 @@
+name: Reddit scrape
+
+# Runs daily on GitHub's own schedule, or by hand from the Actions tab: the top posts of the
+# day of every active subreddit (1 credit each). A subreddit whose last successful scrape is
+# more than 36 hours old (a missed or failed day) reads the top of the week instead.
+# 04:07 UTC = 09:37 IST. Not on the hour: GitHub delays scheduled runs most at the top of the hour.
+on:
+  schedule:
+    - cron: "7 4 * * *"
+  workflow_dispatch:
+
+# One Reddit run at a time, shared with reddit-new-account.yml.
+concurrency:
+  group: reddit-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scrape Reddit
+        env:
+          AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+          SCRAPE_CREATORS: ${{ secrets.SCRAPE_CREATORS }}
+        run: python3 scripts/reddit.py

@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Reddit scraper for the Content OS Database Airtable base.
 
-For every Accounts row with Scrape = Active and Platform = Reddit:
-  1. Fetch the subreddit's top posts of the week from ScrapeCreators (reddit/subreddit),
-     exactly one call per subreddit: no retries, no fallback call, no paging.
+Runs daily. For every Accounts row with Scrape = Active and Platform = Reddit:
+  1. Fetch the subreddit's top posts from ScrapeCreators (reddit/subreddit, sort=top),
+     exactly one call per subreddit (1 credit): no retries, no fallback call, no paging.
+     Timeframe "day" (the last 24 hours, about 25 posts) on the daily run. "week" for a new
+     subreddit's first scrape (no Last Scraped yet), and to catch up when the last
+     successful scrape is more than CATCHUP_HOURS old (missed days).
   2. Create new posts in Reddit Posts (Status = New, Media) and refresh existing
      ones (every field except Status, so "Reviewed" marks are kept).
      Media is only sent when the stored field is empty, so files are never duplicated.
      Reddit videos need a free DASHPlaylist.mpd fetch from v.redd.it; if that fails
      the post is saved without Media and the next run tries again.
-  3. Record Last Scraped / Last Scrape Status / Scrape Error on the account.
+     Only the returned Post IDs are looked up in Airtable.
+  3. On success: Last Scraped = now, Last Scrape Status = ok, Scrape Error cleared. On
+     failure: error and the reason; Last Scraped is kept, so the next run catches up.
+
+  python3 scripts/reddit.py                 daily run: every active subreddit
+  python3 scripts/reddit.py --new-accounts  only subreddits with no Last Scraped (just added)
 
 Runs unattended (standard library only). Keys come from ../.env or the
 environment: AIRTABLE_ACCESS_TOKEN, SCRAPE_CREATORS. See project.md.
@@ -23,7 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +45,7 @@ REDDIT_URL = "https://www.reddit.com"
 ACCOUNTS = "tbl04PJf51XEAiA8h"
 A_NAME = "fldPwDwLjGikNchgw"
 A_PLATFORM = "fldWYqll9jXSskuSC"
+A_PLATFORM_ID = "fldVaDjv7ixoxEE8N"
 A_HANDLE = "fldABp0JmnZKyiajW"
 A_SCRAPE = "flduo9Gt6GDKLEEs3"
 A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
@@ -64,6 +73,8 @@ P_MEDIA = "fld9xymRDoAepsUwn"
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
+CATCHUP_HOURS = 36   # last success older than this (a missed day): read the top of the week
+LOOKUP_CHUNK = 50    # Post IDs per Airtable lookup
 BATCH = 10  # Airtable's max records per write request
 
 
@@ -170,12 +181,13 @@ def scrapecreators(path, params=None):
     return data
 
 
-def fetch_posts(subreddit):
-    """One paid call, first page only ("after" is ignored).
-    Returns (posts, credits_charged, credits_remaining)."""
+def fetch_posts(subreddit, timeframe="day"):
+    """One paid call, first page only ("after" is ignored). The subreddit name is not
+    case-sensitive here. Returns (posts, credits_charged, credits_remaining)."""
     data = scrapecreators("/v1/reddit/subreddit",
-                          {"subreddit": subreddit, "sort": "top", "timeframe": "week"})
-    return data.get("posts") or [], data.get("credits_charged"), data.get("credits_remaining")
+                          {"subreddit": subreddit, "sort": "top", "timeframe": timeframe})
+    posts = data.get("posts") if isinstance(data.get("posts"), list) else []
+    return [p for p in posts if isinstance(p, dict)], data.get("credits_charged"), data.get("credits_remaining")
 
 
 # --- Mapping --------------------------------------------------------------
@@ -289,23 +301,62 @@ def post_fields(post, account_id, now, existing=None):
 
 # --- Main -----------------------------------------------------------------
 
+def parse_iso(value):
+    """ISO 8601 string -> aware datetime (UTC), or None."""
+    utc = to_utc(value)
+    return datetime.strptime(utc, "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc) if utc else None
+
+
+def timeframe_for(account, now_dt):
+    """"week" for a new subreddit (no Last Scraped) or one whose last success is more than
+    CATCHUP_HOURS old, else "day"."""
+    last = parse_iso(account["fields"].get(A_LAST_SCRAPED))
+    return "day" if last and now_dt - last <= timedelta(hours=CATCHUP_HOURS) else "week"
+
+
+def lookup_existing(ids, existing):
+    """Add to `existing` (post ID -> {"id", "media"}) the given IDs already in Reddit Posts,
+    LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
+    todo = [i for i in dict.fromkeys(ids) if i not in existing]
+    for i in range(0, len(todo), LOOKUP_CHUNK):
+        chunk = todo[i:i + LOOKUP_CHUNK]
+        quoted = ",".join("{%s}='%s'" % (P_POST_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
+        body = {"filterByFormula": f"OR({quoted})", "fields": [P_POST_ID, P_MEDIA],
+                "returnFieldsByFieldId": True, "pageSize": 100}
+        while True:
+            page = airtable("POST", f"{POSTS}/listRecords", body=body)
+            for r in page.get("records", []):
+                pid = r["fields"].get(P_POST_ID)
+                if pid in chunk:
+                    # Empty attachment fields are left out of Airtable's response: presence = filled.
+                    existing[pid] = {"id": r["id"], "media": bool(r["fields"].get(P_MEDIA))}
+            if not page.get("offset"):
+                break
+            body["offset"] = page["offset"]
+
+
+def subreddit_name(account):
+    """Handle without "r/" or slashes."""
+    name = (account["fields"].get(A_HANDLE) or "").strip().strip("/")
+    return (name[2:] if name.lower().startswith("r/") else name).strip("/")
+
+
 def scrape_account(account, existing, now):
     """Scrape one subreddit; mutates `existing` (post ID -> record info). Returns stats."""
-    fields = account["fields"]
-    subreddit = (fields.get(A_HANDLE) or "").strip().lstrip("/")
-    if subreddit.lower().startswith("r/"):
-        subreddit = subreddit[2:]
-    subreddit = subreddit.strip("/")
+    subreddit = subreddit_name(account)
     if not subreddit:
         raise ValueError("Handle (subreddit) is empty")
+    timeframe = timeframe_for(account, parse_iso(now))
 
-    posts, charged, remaining = fetch_posts(subreddit)
-    stats = {"created": 0, "updated": 0, "media_added": 0, "media_skipped": 0,
+    posts, charged, remaining = fetch_posts(subreddit, timeframe)
+    stats = {"created": 0, "updated": 0, "media_added": 0, "media_skipped": 0, "timeframe": timeframe,
              "returned": len(posts), "credits": charged, "remaining": remaining}
+    posts = [p for p in posts if isinstance(p.get("id"), str) and p["id"]]
+    lookup_existing([p["id"] for p in posts], existing)
     creates, updates, seen = [], [], set()
     for post in posts:
-        pid = post.get("id")
-        if not pid or pid in seen:
+        pid = post["id"]
+        if pid in seen:
             continue
         seen.add(pid)
         info = existing.get(pid)
@@ -344,25 +395,23 @@ def scrape_account(account, existing, now):
     return stats
 
 
-def main():
+def main(new_accounts=False):
+    """new_accounts: only the subreddits with no Last Scraped (just added)."""
     load_env()
     started = datetime.now(timezone.utc)
-    log("Reddit scrape started")
+    log("Reddit scrape started" + (" (new accounts only)" if new_accounts else ""))
 
     accounts = [
-        a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_HANDLE, A_SCRAPE])
+        a for a in list_records(ACCOUNTS, [A_NAME, A_PLATFORM, A_HANDLE, A_SCRAPE, A_LAST_SCRAPED])
         if a["fields"].get(A_SCRAPE) == "Active" and a["fields"].get(A_PLATFORM) == "Reddit"
     ]
-    log(f"{len(accounts)} active Reddit account(s)")
+    if new_accounts:
+        accounts = [a for a in accounts if not parse_iso(a["fields"].get(A_LAST_SCRAPED))]
+        log(f"{len(accounts)} new Reddit account(s)")
+    else:
+        log(f"{len(accounts)} active Reddit account(s)")
 
-    # Empty attachment fields are left out of Airtable's response, so presence = filled.
-    existing = {
-        r["fields"][P_POST_ID]: {"id": r["id"], "media": bool(r["fields"].get(P_MEDIA))}
-        for r in list_records(POSTS, [P_POST_ID, P_MEDIA])
-        if r["fields"].get(P_POST_ID)
-    }
-    log(f"{len(existing)} post(s) already in Reddit Posts")
-
+    existing = {}  # post ID -> {"id", "media"}, filled by lookups of the returned IDs
     results, remaining = [], None
     for account in accounts:
         name = account["fields"].get(A_NAME) or account["id"]
@@ -373,15 +422,18 @@ def main():
             status, error = "ok", None
         except Exception as e:  # no retries: record on the account and move on
             stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "media_added": 0,
-                                                  "media_skipped": 0, "returned": 0,
+                                                  "media_skipped": 0, "returned": 0, "timeframe": "-",
                                                   "credits": None, "remaining": None}
             status, error = "error", f"{now} {type(e).__name__}: {e}"[:5000]
             log(f"  ERROR: {error}")
         remaining = stats["remaining"] if stats["remaining"] is not None else remaining
 
+        # Last Scraped only moves on success, so a failed subreddit catches up next run.
+        update = {A_LAST_STATUS: status, A_SCRAPE_ERROR: error}
+        if status == "ok":
+            update[A_LAST_SCRAPED] = now
         try:
-            airtable("PATCH", ACCOUNTS, body={"records": [{"id": account["id"], "fields": {
-                A_LAST_SCRAPED: now, A_LAST_STATUS: status, A_SCRAPE_ERROR: error}}]})
+            airtable("PATCH", ACCOUNTS, body={"records": [{"id": account["id"], "fields": update}]})
         except HttpError as e:
             log(f"  Could not update account row: {e}")
 
@@ -391,8 +443,8 @@ def main():
     print("Summary")
     for name, status, stats, error in results:
         used = stats["credits"] if stats["credits"] is not None else 0
-        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']}"
-              f" (of {stats['returned']} returned) | media files added {stats['media_added']},"
+        print(f"  {name}: {status} | top of the {stats['timeframe']} | created {stats['created']},"
+              f" updated {stats['updated']} (of {stats['returned']} returned) | media files added {stats['media_added']},"
               f" media skipped {stats['media_skipped']} | credits used {used}")
         if error:
             print(f"    error: {error}")
@@ -404,4 +456,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    args = sys.argv[1:]
+    if args not in ([], ["--new-accounts"]):
+        sys.exit("Usage: reddit.py [--new-accounts]")
+    sys.exit(main(new_accounts=bool(args)))
