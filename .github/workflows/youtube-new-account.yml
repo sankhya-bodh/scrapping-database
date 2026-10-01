@@ -4,8 +4,8 @@ name: YouTube new account
 # "New accounts"), with that row's record ID, or by hand from the Actions tab.
 #   1. setup: fills the row from its Profile URL (ScrapeCreators channel, 1 credit) and sets
 #      Scrape = Active. Skipped when no record ID is given.
-#   2. scrape: reads every channel with no Last Scraped yet (1 credit each), stores its videos
-#      from the last 3 days, then sets Last Scraped. No calls if there are none.
+#   2. scrape: reads every channel with no Last Scraped yet (1 credit each), stores its 30
+#      newest videos, then sets Last Scraped. No calls if there are none.
 on:
   workflow_dispatch:
     inputs:
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Scrape new YouTube channels (last 3 days)
+      - name: Scrape new YouTube channels (30 newest videos)
         env:
           AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
           SCRAPE_CREATORS: ${{ secrets.SCRAPE_CREATORS }}

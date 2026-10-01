@@ -52,7 +52,7 @@ It prints a summary per account and the estimated credits used. It exits with co
 
 - **Every 3 days per channel.** `.github/workflows/youtube-scrape.yml` runs daily at 03:37 UTC (09:07 IST) and scrapes the channels whose Last Scraped is 3 days old (or empty). Days when nothing is due cost nothing.
 - **One call per channel:** ScrapeCreators `channel-videos` (`sort=latest`, `includeExtras=true`, 1 credit) returns the 30 newest regular videos. Shorts come back in a separate list and are not stored.
-- **New videos** published since 3 days before the channel's last scrape are created with Status `New`. A new channel's first scrape stores its last 3 days, no further back.
+- **New videos:** every returned video not yet stored is created with Status `New`. A new channel's first scrape stores its 30 newest videos; later runs store whatever it has posted since.
 - **Existing videos** among the 30 newest get fresh views, likes and comments; Status is kept. Older videos stop being updated once they drop out of the 30 newest.
 - **Thumbnail** is saved as an image attachment (Airtable keeps its own copy), once: when a video is stored, or on the next scrape if the field is empty.
 - **After a failure:** the channel is marked `error` with the reason and keeps its Last Scraped, so the next daily run retries it.
@@ -104,7 +104,7 @@ New accounts come in through an Airtable form that fills **Profile URL** and **P
 | Platform | Workflow | 1. Setup | 2. First scrape |
 |---|---|---|---|
 | X | `x-new-account.yml` | `scripts/x_profile.py` (ScrapeCreators `/v1/twitter/profile`, 1 credit) | `x.py --new-accounts`: the last 24 hours |
-| YouTube | `youtube-new-account.yml` | `scripts/youtube_profile.py` (ScrapeCreators `/v1/youtube/channel`, 1 credit) | `youtube.py --new-accounts`: the last 3 days |
+| YouTube | `youtube-new-account.yml` | `scripts/youtube_profile.py` (ScrapeCreators `/v1/youtube/channel`, 1 credit) | `youtube.py --new-accounts`: the 30 newest videos |
 | Reddit | `reddit-new-account.yml` | `scripts/reddit_profile.py` (ScrapeCreators `/v1/reddit/subreddit/details`, 1 credit) | `reddit.py --new-accounts`: the top of the week |
 
 **Setup** reads the account from the Profile URL, checks it isn't already tracked, and fills Name, Platform ID, Handle, Profile URL, Avatar URL, Bio, Verified and Followers (X) or Subscribers (YouTube), then sets Scrape = Active.

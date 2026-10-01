@@ -6,8 +6,8 @@ Scrape = Active and Platform = YouTube that are due (no Last Scraped yet, or Las
 RUN_DAYS days ago, less DUE_SLACK_HOURS so a slightly early daily run still counts):
   1. Fetch the channel's 30 newest regular videos (no Shorts) from ScrapeCreators
      (channel-videos, sort=latest, includeExtras=true): one call per channel, no retries.
-  2. Create the new ones in YouTube Videos (Status = New) if published since LOOKBACK_DAYS
-     before the channel's Last Scraped (a new channel: its last 3 days, no further back).
+  2. Create every returned video not yet in YouTube Videos (Status = New): a new channel's
+     first scrape stores its 30 newest videos; later runs store whatever is new since.
      Refresh every returned video already stored (every field except Status, so "Reviewed"
      marks are kept). Only the returned Video IDs are looked up in Airtable. The thumbnail
      is saved as an attachment (Thumbnail), only when that field is empty, so it's never
@@ -67,7 +67,6 @@ V_LAST_SCRAPED = "fldGSuB2qHERC4p5l"
 
 RUN_DAYS = 3          # each channel is scraped every 3 days
 DUE_SLACK_HOURS = 6   # a channel is due this long before its 3 days are up (daily-run jitter)
-LOOKBACK_DAYS = 3     # create videos published up to this long before the last scrape
 LOOKUP_CHUNK = 50     # Video IDs per Airtable lookup
 BATCH = 10  # Airtable's max records per write request
 
@@ -234,14 +233,6 @@ def is_due(account, now_dt):
     return last is None or last <= now_dt - timedelta(days=RUN_DAYS) + timedelta(hours=DUE_SLACK_HOURS)
 
 
-def create_since(account, now_dt):
-    """Videos published from this moment on are created: LOOKBACK_DAYS before the channel's
-    Last Scraped (a margin for premieres and videos made public late), or for a new channel
-    its last LOOKBACK_DAYS days."""
-    last = parse_iso(account["fields"].get(A_LAST_SCRAPED))
-    return min(last or now_dt, now_dt) - timedelta(days=LOOKBACK_DAYS)
-
-
 def thumbnail_files(video):
     """Attachment list for the Thumbnail field (Airtable copies the image from the URL).
     The API's link (hq720.jpg?sqp=...) serves AVIF; without the query it's a 1280x720 JPEG."""
@@ -278,10 +269,9 @@ def scrape_account(account, existing, now):
     channel_id = (fields.get(A_PLATFORM_ID) or "").strip()
     if not channel_id:
         raise ValueError("Platform ID (channelId) is empty")
-    since = create_since(account, parse_iso(now))
 
     videos, charged, remaining = fetch_videos(channel_id)
-    stats = {"created": 0, "updated": 0, "older": 0, "thumbnails": 0, "returned": len(videos),
+    stats = {"created": 0, "updated": 0, "thumbnails": 0, "returned": len(videos),
              "credits": charged, "remaining": remaining}
     videos = [v for v in videos if isinstance(v.get("id"), str) and v["id"]]
     lookup_existing([v["id"] for v in videos], existing)
@@ -298,11 +288,6 @@ def scrape_account(account, existing, now):
             if files and not info["thumb"]:  # fill an empty Thumbnail; never re-send a filled one
                 record["fields"][V_THUMBNAIL] = files
             updates.append(record)
-            continue
-        # publishedTime is only an estimate ("3 weeks ago"); publishDate is exact.
-        published = parse_iso(video.get("publishDate")) or parse_iso(video.get("publishedTime"))
-        if published is not None and published < since:
-            stats["older"] += 1  # from before this channel was added: not stored
             continue
         record = {"fields": video_fields(video, account["id"], now, True)}
         files = thumbnail_files(video)
@@ -352,7 +337,7 @@ def main(new_accounts=False):
             stats = scrape_account(account, existing, now)
             status, error = "ok", None
         except Exception as e:  # no retries: record on the account and move on
-            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "older": 0, "thumbnails": 0, "returned": 0,
+            stats = getattr(e, "stats", None) or {"created": 0, "updated": 0, "thumbnails": 0, "returned": 0,
                                                   "credits": None, "remaining": None}
             status, error = "error", f"{now} {type(e).__name__}: {e}"[:5000]
             log(f"  ERROR: {error}")
@@ -373,8 +358,8 @@ def main(new_accounts=False):
     print("Summary")
     for name, status, stats, error in results:
         used = stats["credits"] if stats["credits"] is not None else 0
-        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']},"
-              f" {stats['older']} older not stored (of {stats['returned']} returned) | thumbnails saved"
+        print(f"  {name}: {status} | created {stats['created']}, updated {stats['updated']}"
+              f" (of {stats['returned']} returned) | thumbnails saved"
               f" {stats['thumbnails']} | credits used {used}")
         if error:
             print(f"    error: {error}")

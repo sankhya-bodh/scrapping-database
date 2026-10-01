@@ -15,7 +15,7 @@ ID that the Airtable form created. The form fills Profile URL (and Platform = Yo
   4. The row gets Name, Platform = YouTube, Platform ID (channel ID), Handle, Profile URL,
      Avatar URL (800px), Bio, Verified, Subscribers, Last Scrape Status = never, and
      Scrape = Active in the same write. Last Scraped stays empty, so
-     youtube.py --new-accounts then reads the channel's last 3 days.
+     youtube.py --new-accounts then stores the channel's 30 newest videos.
 A row that fails is left with Scrape not Active, Last Scrape Status = error and the reason in
 Scrape Error; the run exits 1. A row that already has a Platform ID (set up before, or an
 existing channel, active or paused) is left alone (exit 0).

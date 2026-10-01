@@ -123,14 +123,14 @@ def run(sc, at, new_accounts=False):
     return code, buf.getvalue()
 
 
-# 1. New channel: only its last 3 days are stored; one call; Shorts ignored
+# 1. New channel: all 30 newest (here 4) are stored; one call; Shorts ignored
 vids = [video("new1", 0.5), video("new2", 2.9), video("old1", 3.1), video("old2", 40)]
 sc, at = FakeSC(vids), FakeAT([channel_row()])
 code, out = run(sc, at)
 check("new channel: exit 0, one call, sort=latest + includeExtras", code == 0 and sc.calls == [
     ("/v1/youtube/channel-videos", {"channelId": CH, "sort": "latest", "includeExtras": "true"})])
-check("new channel: last 3 days created, older not", {r["fields"][yt.V_VIDEO_ID] for r in at.posted()} == {"new1", "new2"}
-      and "2 older not stored" in out)
+check("new channel: every returned video created, old ones too", {r["fields"][yt.V_VIDEO_ID] for r in at.posted()}
+      == {"new1", "new2", "old1", "old2"} and "created 4" in out)
 check("Shorts list ignored", "short1" not in str(at.writes))
 check("created: Status New, exact UTC date", all(r["fields"][yt.V_STATUS] == "New" for r in at.posted())
       and next(r for r in at.posted() if r["fields"][yt.V_VIDEO_ID] == "new1")["fields"][yt.V_PUBLISHED] == iso(NOW - timedelta(days=0.5)))
@@ -149,7 +149,7 @@ sc, at = FakeSC(vids), FakeAT([channel_row(last=NOW - timedelta(days=1))])
 code, out = run(sc, at)
 check("not due: no call, no writes, exit 0", code == 0 and sc.calls == [] and at.writes == [])
 
-# 3. A scheduled run: new videos since the last scrape (with 3 days of margin), every returned video refreshed
+# 3. A scheduled run: every returned video not yet stored is created, every stored one refreshed
 last = NOW - timedelta(days=3)
 stored = [{"id": "recOLD1", "fields": {yt.V_VIDEO_ID: "old1", yt.V_STATUS: "Reviewed"}},
           {"id": "recOLD2", "fields": {yt.V_VIDEO_ID: "old2"}}]
@@ -157,8 +157,8 @@ vids = [video("v_new", 1), video("v_late", 5.5), video("old1", 3.1, viewCountInt
         video("v_before", 7)]
 sc, at = FakeSC(vids), FakeAT([channel_row(last=last)], stored)
 code, out = run(sc, at)
-check("scheduled: new since last scrape - 3 days created", {r["fields"][yt.V_VIDEO_ID] for r in at.posted()} == {"v_new", "v_late"})
-check("scheduled: video from before the window not created", "1 older not stored" in out)
+check("scheduled: every video not yet stored created (late-public and older ones too)",
+      {r["fields"][yt.V_VIDEO_ID] for r in at.posted()} == {"v_new", "v_late", "v_before"})
 up = {r["id"]: r["fields"] for r in at.patched()}
 check("scheduled: every stored video refreshed, any age", set(up) == {"recOLD1", "recOLD2"} and up["recOLD1"][yt.V_VIEWS] == 5000
       and up["recOLD2"][yt.V_VIEWS] == 9)
@@ -185,12 +185,14 @@ sc, at = FakeSC([video("t3", 1, thumbnail=None)]), FakeAT([channel_row()])
 run(sc, at)
 check("thumbnail: missing in the API -> no attachment, video still saved", len(at.posted()) == 1 and yt.V_THUMBNAIL not in at.posted()[0]["fields"])
 
-# 4. Dates: rough publishedTime only used when publishDate is missing
-check("window uses publishDate when there", yt.parse_iso(video("a", 1)["publishDate"]) == NOW - timedelta(days=1))
-sc, at = FakeSC([video("rough", 1, exact=False), video("rough_old", 60, exact=False), video("nodate", 1, exact=False, publishedTime=None)]), FakeAT([channel_row()])
+# 4. Dates: Published = exact publishDate in UTC; the rough estimate only when it's missing
+sc, at = FakeSC([video("exact", 1), video("rough", 60, exact=False), video("nodate", 1, exact=False, publishedTime=None)]), FakeAT([channel_row()])
 run(sc, at)
-got = {r["fields"][yt.V_VIDEO_ID] for r in at.posted()}
-check("no publishDate: the estimate decides; no date at all is stored (not missed)", got == {"rough", "nodate"})
+pub = {r["fields"][yt.V_VIDEO_ID]: r["fields"].get(yt.V_PUBLISHED) for r in at.posted()}
+check("dates: all stored whatever their date", set(pub) == {"exact", "rough", "nodate"})
+check("dates: exact publishDate converted to UTC", pub["exact"] == iso(NOW - timedelta(days=1)))
+check("dates: estimate used when publishDate is missing; none -> left empty",
+      pub["rough"] == iso(NOW - timedelta(days=60) + timedelta(days=20)) and pub["nodate"] is None)
 
 # 5. Failures: Last Scraped kept, so the channel is due again tomorrow
 sc, at = FakeSC(fail=yt.HttpError("HTTP 500 from /v1/youtube/channel-videos: oops")), FakeAT([channel_row(last=last)])
