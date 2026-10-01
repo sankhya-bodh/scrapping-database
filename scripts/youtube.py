@@ -244,10 +244,11 @@ def create_since(account, now_dt):
 
 
 def thumbnail_files(video):
-    """Attachment list for the Thumbnail field (Airtable copies the image from the URL)."""
+    """Attachment list for the Thumbnail field (Airtable copies the image from the URL).
+    The API's link (hq720.jpg?sqp=...) serves AVIF; without the query it's a 1280x720 JPEG."""
     url = video.get("thumbnail")
     if isinstance(url, str) and url.startswith("http"):
-        return [{"url": url, "filename": f"{video['id']}.jpg"}]
+        return [{"url": url.split("?")[0], "filename": f"{video['id']}.jpg"}]
     return []
 
 

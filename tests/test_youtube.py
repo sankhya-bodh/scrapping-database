@@ -168,9 +168,9 @@ code, out = run(FakeSC(vids), at)
 check("running again: no duplicates", len([v for v in at.videos if v["fields"].get(yt.V_VIDEO_ID) == "v_new"]) == 1)
 
 # 3b. Thumbnail saved as an attachment, once; the old URL field isn't written
-sc, at = FakeSC([video("t1", 1)]), FakeAT([channel_row()])
+sc, at = FakeSC([video("t1", 1, thumbnail="https://i.ytimg.com/vi/t1/hq720.jpg?sqp=-oaymwEnCNAF&rs=AOn4CL")]), FakeAT([channel_row()])
 code, out = run(sc, at)
-c = at.posted()[0]["fields"]
+c = at.posted()[0]["fields"]  # the query (which makes YouTube serve AVIF) is dropped: JPEG
 check("thumbnail: attached on create, named by video ID", c.get(yt.V_THUMBNAIL) == [
     {"url": "https://i.ytimg.com/vi/t1/hq720.jpg", "filename": "t1.jpg"}] and "thumbnails saved 1" in out)
 check("thumbnail: old Thumbnail URL field not written", yt.V_THUMBNAIL_URL not in c)
