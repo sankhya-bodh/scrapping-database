@@ -2,7 +2,8 @@
 ScrapeCreators, v.redd.it and Airtable are fakes.
 
 The fake Airtable holds a single Scraped Content table and checks every write against the
-table's real schema (field IDs, types, select options, as created in Airtable on 2026-10-02):
+table's real schema (field IDs, types, select options, as created in Airtable on 2026-10-02,
+without the Thumbnail field, which was removed: thumbnails go in Media):
 an unknown field, a select value that isn't an option or a value of the wrong type is
 rejected with a 422, as Airtable does, and counted as a failure here.
 
@@ -73,7 +74,6 @@ SCHEMA = {
     "fldnpgk0h2RfSSsJX": ("Bookmarks", "number", None),
     "fldAlSelO3OXm353v": ("Score", "number", None),
     "fldXWnVTWEqgepC02": ("Upvote Ratio", "percent", None),
-    "fldtvY62II7Sz99wS": ("Thumbnail", "multipleAttachments", None),
     "fld0CsTd3XkegpUEP": ("Media", "multipleAttachments", None),
     "fld2D5rCtlEW9w2Hn": ("Status", "singleSelect", {"New", "Reviewed"}),
     "fldtqUWCeQmuP2Ofs": ("Last Scraped", "dateTime", None),
@@ -86,17 +86,17 @@ ACCOUNT_SCHEMA = {  # the Accounts fields the scrapers write
     "fldVaDjv7ixoxEE8N": ("Platform ID", "singleLineText", None),
 }
 ID, PLATFORM, ACCOUNT, STATUS = "fldQo17O1tcoje3HB", "fld79CFY4T9xkiA6Q", "fldn8KHcs9SurgWBE", "fld2D5rCtlEW9w2Hn"
-ATTACHMENTS = ("fldtvY62II7Sz99wS", "fld0CsTd3XkegpUEP")
+ATTACHMENTS = ("fld0CsTd3XkegpUEP",)
 DATE_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{3})?Z$")
 PER_PLATFORM = {  # what each platform may fill (its own fields only)
     "X": {"Content ID", "Title", "Platform", "Type", "Text", "Account", "URL", "Published", "Views", "Likes", "Comments",
           "Reposts", "Quotes", "Bookmarks", "Media", "Status", "Last Scraped"},
     "YouTube": {"Content ID", "Title", "Platform", "Type", "Text", "Account", "URL", "Published", "Duration", "Views",
-                "Likes", "Comments", "Thumbnail", "Status", "Last Scraped"},
+                "Likes", "Comments", "Media", "Status", "Last Scraped"},
     "Reddit": {"Content ID", "Title", "Platform", "Type", "Text", "Account", "URL", "Author", "Flair", "Published",
                "Comments", "Score", "Upvote Ratio", "Media", "Status", "Last Scraped"},
     "Instagram": {"Content ID", "Title", "Platform", "Type", "Text", "Account", "URL", "Published", "Duration", "Views",
-                  "Likes", "Comments", "Thumbnail", "Media", "Status", "Last Scraped"},
+                  "Likes", "Comments", "Media", "Status", "Last Scraped"},
 }
 
 
@@ -362,6 +362,8 @@ for seed in (1, 2, 3):
           and types_["Reddit"] <= {"Text", "Photo", "Video", "Gallery", "Link"} and types_["Instagram"] <= {"Reel", "Photo", "Carousel"}
           and None not in set().union(*types_.values()))
     check(f"{tag} every row has a Title", all(r["fields"].get("fldNkd3XzlbpdNPW6") for r in at.rows))
+    check(f"{tag} every YouTube row has its thumbnail in Media", all(r["fields"].get("fld0CsTd3XkegpUEP")
+          for r in at.rows if r["fields"][PLATFORM] == "YouTube"))
 
 # Every field ID the scripts use is in the schema, and the four scripts agree on them
 consts = {}

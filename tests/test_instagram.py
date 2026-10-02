@@ -138,9 +138,10 @@ check("reel: Views = plays, Likes, Comments, Duration rounded", (r[ig.P_VIEWS], 
       == (12345, 678, 9, 32))
 check("reel: link, account, UTC date, Last Scraped", r[ig.P_URL] == "https://www.instagram.com/p/REEL1/" and r[ig.P_ACCOUNT] == [ACC]
       and r[ig.P_PUBLISHED] == iso(NOW - timedelta(hours=5)) and r[ig.P_LAST_SCRAPED] == iso(NOW))
-check("reel: Media = the biggest video, Thumbnail = display_uri", r[ig.P_MEDIA] == [
-    {"url": "https://cdn.instagram.com/REEL1_v_720.mp4?oe=1", "filename": "REEL1.mp4"}]
-      and r[ig.P_THUMBNAIL] == [{"url": "https://cdn.instagram.com/REEL1_thumb.jpg?oe=1"}])
+check("reel: Media = the cover (display_uri), then the biggest video", r[ig.P_MEDIA] == [
+    {"url": "https://cdn.instagram.com/REEL1_thumb.jpg?oe=1", "filename": "REEL1_cover.jpg"},
+    {"url": "https://cdn.instagram.com/REEL1_v_720.mp4?oe=1", "filename": "REEL1.mp4"}])
+check("no Thumbnail field written (it's being removed from Airtable)", "fldtvY62II7Sz99wS" not in str(at.writes))
 c = got["CAR1"]
 check("carousel: every usable slide in order, biggest version, numbered", [f["filename"] for f in c[ig.P_MEDIA]] == ["CAR1_1.jpg", "CAR1_2.mp4"]
       and c[ig.P_MEDIA][0]["url"].endswith("_1080.jpg?oe=1") and c[ig.P_MEDIA][1]["url"].endswith("_720.mp4?oe=1"))
@@ -150,7 +151,7 @@ check("photo: the biggest image", got["PHO1"][ig.P_MEDIA] == [{"url": "https://c
 a = at.account()
 check("account: Last Scraped, ok, error cleared", a[ig.A_LAST_SCRAPED] == iso(NOW) and a[ig.A_LAST_STATUS] == "ok"
       and ig.A_SCRAPE_ERROR in a and a[ig.A_SCRAPE_ERROR] is None)
-check("summary: attachments and credits", "attachments added 7" in out and "credits used 1" in out and "credits remaining: 800" in out)
+check("summary: attachments and credits", "attachments added 5" in out and "credits used 1" in out and "credits remaining: 800" in out)
 
 # 2. Title edge cases
 check("title: blank lines skipped, cut to 100", ig.post_fields(item("T", caption="\n \n" + "b" * 300), ACC, iso(NOW))[ig.P_TITLE] == "b" * 100)
@@ -160,20 +161,22 @@ f = ig.post_fields(item("T", like_and_view_counts_disabled=True), ACC, iso(NOW))
 check("hidden likes: Likes left out", ig.P_LIKES not in f and f[ig.P_VIEWS] == 12345)
 f = ig.post_fields(item("T", created_at=None), ACC, iso(NOW))
 check("no created_at: taken_at used", f[ig.P_PUBLISHED] == iso(NOW - timedelta(hours=5)))
+f = ig.post_fields(item("T", display_uri=None), ACC, iso(NOW))
+check("reel without a cover: just the video", [a["filename"] for a in f[ig.P_MEDIA]] == ["T.mp4"])
 f = ig.post_fields(item("T", kind=99), ACC, iso(NOW))
 check("unknown media_type: no Type, no Media, still saved", ig.P_TYPE not in f and ig.P_MEDIA not in f and f[ig.P_CONTENT_ID] == "T")
 
 # 3. Seen again: updated, Status kept, attachments only where empty
 stored = [{"id": "recR", "fields": {ig.P_CONTENT_ID: "REEL1", ig.P_PLATFORM: "Instagram", ig.P_STATUS: "Reviewed",
-                                     ig.P_THUMBNAIL: [{"id": "att1"}], ig.P_MEDIA: [{"id": "att2"}]}},
+                                     ig.P_MEDIA: [{"id": "att2"}]}},
           {"id": "recP", "fields": {ig.P_CONTENT_ID: "PHO1", ig.P_PLATFORM: "Instagram"}}]
 sc, at = FakeSC([item("REEL1", ig_play_count=99999), item("PHO1", kind=1)]), FakeAT([account()], stored)
 run(sc, at)
 up = {r["id"]: r["fields"] for r in at.patched()}
 check("seen again: updated, new plays, no duplicate", set(up) == {"recR", "recP"} and up["recR"][ig.P_VIEWS] == 99999 and at.posted() == [])
 check("seen again: Status never sent", all(ig.P_STATUS not in f for f in up.values()))
-check("seen again: filled attachments not re-sent, empty ones filled", ig.P_THUMBNAIL not in up["recR"] and ig.P_MEDIA not in up["recR"]
-      and len(up["recP"][ig.P_THUMBNAIL]) == 1 and len(up["recP"][ig.P_MEDIA]) == 1)
+check("seen again: filled Media not re-sent, empty Media filled", ig.P_MEDIA not in up["recR"]
+      and len(up["recP"][ig.P_MEDIA]) == 1)
 same = [{"id": "recYT", "fields": {ig.P_CONTENT_ID: "REEL1", ig.P_PLATFORM: "YouTube", ig.P_STATUS: "Reviewed"}}]
 sc, at = FakeSC([item("REEL1")]), FakeAT([account()], same)
 run(sc, at)

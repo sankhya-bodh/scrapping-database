@@ -11,7 +11,7 @@ RUN_DAYS days ago, less DUE_SLACK_HOURS so a slightly early daily run still coun
      videos; later runs store whatever is new since.
      Refresh every returned video already stored (every field except Status, so "Reviewed"
      marks are kept). Only the returned Video IDs are looked up in Airtable. The thumbnail
-     is saved as an attachment (Thumbnail), only when that field is empty, so it's never
+     is saved as an attachment in Media, only when that field is empty, so it's never
      duplicated.
   3. On success: Last Scraped = now, Last Scrape Status = ok, Scrape Error cleared. On
      failure: error and the reason; Last Scraped is kept, so the next daily run retries.
@@ -66,7 +66,7 @@ V_DURATION = "fldlIejl80YEiJ4th"
 V_VIEWS = "fldoJ7VfdRHC78CeJ"
 V_LIKES = "fldBybnTMpW6Egc3O"
 V_COMMENTS = "fldPIA6Zm9Rib9Xe8"
-V_THUMBNAIL = "fldtvY62II7Sz99wS"  # attachment
+V_MEDIA = "fld0CsTd3XkegpUEP"  # attachment: the video's thumbnail
 V_STATUS = "fld2D5rCtlEW9w2Hn"
 V_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
 PLATFORM = "YouTube"  # the Platform value of this script's rows
@@ -242,7 +242,7 @@ def is_due(account, now_dt):
 
 
 def thumbnail_files(video):
-    """Attachment list for the Thumbnail field (Airtable copies the image from the URL).
+    """The thumbnail, as the attachment list for the Media field (Airtable copies the image).
     The API's link (hq720.jpg?sqp=...) serves AVIF; without the query it's a 1280x720 JPEG.
     A thumbnail being A/B tested (hq720_custom_2.jpg?sqp=...) 404s without the query, so it
     falls back to the video's hq720.jpg (Airtable silently drops a file it can't download)."""
@@ -254,14 +254,14 @@ def thumbnail_files(video):
 
 
 def lookup_existing(ids, existing):
-    """Add to `existing` (video ID -> {"id", "thumb"}) the given IDs that are already in Scraped
+    """Add to `existing` (video ID -> {"id", "media"}) the given IDs that are already in Scraped
     Content (among the YouTube rows), LOOKUP_CHUNK per filtered query, instead of loading the
     whole table."""
     todo = [i for i in dict.fromkeys(ids) if i not in existing]
     for i in range(0, len(todo), LOOKUP_CHUNK):
         chunk = todo[i:i + LOOKUP_CHUNK]
         quoted = ",".join("{%s}='%s'" % (V_CONTENT_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
-        body = {"filterByFormula": f"AND({{{V_PLATFORM}}}='{PLATFORM}',OR({quoted}))", "fields": [V_CONTENT_ID, V_THUMBNAIL],
+        body = {"filterByFormula": f"AND({{{V_PLATFORM}}}='{PLATFORM}',OR({quoted}))", "fields": [V_CONTENT_ID, V_MEDIA],
                 "returnFieldsByFieldId": True, "pageSize": 100}
         while True:
             page = airtable("POST", f"{VIDEOS}/listRecords", body=body)
@@ -269,14 +269,14 @@ def lookup_existing(ids, existing):
                 vid = r["fields"].get(V_CONTENT_ID)
                 if vid in chunk:
                     # Empty attachment fields are left out of Airtable's response: presence = filled.
-                    existing[vid] = {"id": r["id"], "thumb": bool(r["fields"].get(V_THUMBNAIL))}
+                    existing[vid] = {"id": r["id"], "media": bool(r["fields"].get(V_MEDIA))}
             if not page.get("offset"):
                 break
             body["offset"] = page["offset"]
 
 
 def scrape_account(account, existing, now):
-    """Scrape one account; mutates `existing` (video ID -> {"id", "thumb"}). Returns stats."""
+    """Scrape one account; mutates `existing` (video ID -> {"id", "media"}). Returns stats."""
     fields = account["fields"]
     channel_id = (fields.get(A_PLATFORM_ID) or "").strip()
     if not channel_id:
@@ -297,14 +297,14 @@ def scrape_account(account, existing, now):
         if info is not None:
             record = {"id": info["id"], "fields": video_fields(video, account["id"], now, False)}
             files = thumbnail_files(video)
-            if files and not info["thumb"]:  # fill an empty Thumbnail; never re-send a filled one
-                record["fields"][V_THUMBNAIL] = files
+            if files and not info["media"]:  # fill an empty Media; never re-send a filled one
+                record["fields"][V_MEDIA] = files
             updates.append(record)
             continue
         record = {"fields": video_fields(video, account["id"], now, True)}
         files = thumbnail_files(video)
         if files:
-            record["fields"][V_THUMBNAIL] = files
+            record["fields"][V_MEDIA] = files
         creates.append(record)
 
     try:
@@ -313,9 +313,9 @@ def scrape_account(account, existing, now):
             stats[key] = len(written)
             for sent, rec in zip(records, written):
                 vid = sent["fields"][V_CONTENT_ID]
-                info = existing.setdefault(vid, {"id": rec["id"], "thumb": False})
-                info["thumb"] = info["thumb"] or V_THUMBNAIL in sent["fields"]
-                stats["thumbnails"] += V_THUMBNAIL in sent["fields"]
+                info = existing.setdefault(vid, {"id": rec["id"], "media": False})
+                info["media"] = info["media"] or V_MEDIA in sent["fields"]
+                stats["thumbnails"] += V_MEDIA in sent["fields"]
     except Exception as e:
         e.stats = stats  # the scrape was paid for; keep its credit numbers in the summary
         raise

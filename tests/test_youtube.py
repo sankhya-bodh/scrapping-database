@@ -172,19 +172,20 @@ check("scheduled: Last Scraped = now", at.account()[yt.A_LAST_SCRAPED] == iso(NO
 code, out = run(FakeSC(vids), at)
 check("running again: no duplicates", len([v for v in at.videos if v["fields"].get(yt.V_CONTENT_ID) == "v_new"]) == 1)
 
-# 3b. Thumbnail saved as an attachment, once
+# 3b. Thumbnail saved as an attachment in Media, once
 sc, at = FakeSC([video("t1", 1, thumbnail="https://i.ytimg.com/vi/t1/hq720.jpg?sqp=-oaymwEnCNAF&rs=AOn4CL")]), FakeAT([channel_row()])
 code, out = run(sc, at)
 c = at.posted()[0]["fields"]  # the query (which makes YouTube serve AVIF) is dropped: JPEG
-check("thumbnail: attached on create, named by video ID", c.get(yt.V_THUMBNAIL) == [
+check("thumbnail: attached to Media on create, named by video ID", c.get(yt.V_MEDIA) == [
     {"url": "https://i.ytimg.com/vi/t1/hq720.jpg", "filename": "t1.jpg"}] and "thumbnails saved 1" in out)
 stored = [{"id": "recT1", "fields": {yt.V_CONTENT_ID: "t1", yt.V_PLATFORM: "YouTube"}},
-          {"id": "recT2", "fields": {yt.V_CONTENT_ID: "t2", yt.V_PLATFORM: "YouTube", yt.V_THUMBNAIL: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
+          {"id": "recT2", "fields": {yt.V_CONTENT_ID: "t2", yt.V_PLATFORM: "YouTube", yt.V_MEDIA: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
 sc, at = FakeSC([video("t1", 1), video("t2", 1)]), FakeAT([channel_row(last=NOW - timedelta(days=3))], stored)
 run(sc, at)
 up = {r["id"]: r["fields"] for r in at.patched()}
-check("thumbnail: empty field filled on update (backfill)", len(up["recT1"].get(yt.V_THUMBNAIL, [])) == 1)
-check("thumbnail: filled field never re-sent (no duplicates)", yt.V_THUMBNAIL not in up["recT2"])
+check("thumbnail: the removed Thumbnail field is never written", "fldtvY62II7Sz99wS" not in str(at.writes))
+check("thumbnail: empty Media filled on update (backfill)", len(up["recT1"].get(yt.V_MEDIA, [])) == 1)
+check("thumbnail: filled Media never re-sent (no duplicates)", yt.V_MEDIA not in up["recT2"])
 custom = "https://i.ytimg.com/vi/t4/hq720_custom_2.jpg?sqp=CPi6_dUG-oaymwEnCNAF&rs=AOn4CLBm"  # as seen live 2026-10-02
 check("thumbnail: A/B-test custom thumbnail -> the video's hq720.jpg (the custom one 404s without its query)",
       yt.thumbnail_files(video("t4", 1, thumbnail=custom)) == [{"url": "https://i.ytimg.com/vi/t4/hq720.jpg", "filename": "t4.jpg"}])
@@ -192,7 +193,7 @@ check("thumbnail: other file names kept as they are", [f["url"] for f in yt.thum
       == ["https://i.ytimg.com/vi/t5/hqdefault.jpg"])
 sc, at = FakeSC([video("t3", 1, thumbnail=None)]), FakeAT([channel_row()])
 run(sc, at)
-check("thumbnail: missing in the API -> no attachment, video still saved", len(at.posted()) == 1 and yt.V_THUMBNAIL not in at.posted()[0]["fields"])
+check("thumbnail: missing in the API -> no attachment, video still saved", len(at.posted()) == 1 and yt.V_MEDIA not in at.posted()[0]["fields"])
 
 # 4. Dates: Published = exact publishDate in UTC; the rough estimate only when it's missing
 sc, at = FakeSC([video("exact", 1), video("rough", 60, exact=False), video("nodate", 1, exact=False, publishedTime=None)]), FakeAT([channel_row()])

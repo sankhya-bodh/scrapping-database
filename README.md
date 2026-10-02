@@ -31,8 +31,7 @@ One row per post, video or tweet, from every platform. A row is identified by **
 | Duration | | ✓ | | ✓ (reels) |
 | Reposts, Quotes, Bookmarks | ✓ | | | |
 | Author, Flair, Score, Upvote Ratio | | | ✓ | |
-| Thumbnail | | ✓ | | ✓ |
-| Media | photos, videos | | image, or video + audio | the reel, slides or photo |
+| Media | photos, videos | the thumbnail | image, or video + audio | the reel's cover + video, the slides, or the photo |
 
 Status is set to `New` only when a row is created, so `Reviewed` is never reset. Attachments are sent only while the field is empty, so files are never duplicated.
 
@@ -74,7 +73,7 @@ It prints a summary per account and the estimated credits used. It exits with co
 - **One call per channel:** ScrapeCreators `channel-videos` (`sort=latest`, `includeExtras=true`, 1 credit) returns the 30 newest regular videos. Shorts come back in a separate list and are not stored.
 - **New videos:** every returned video not yet stored is created with Status `New`. A new channel's first scrape stores its 30 newest videos; later runs store whatever it has posted since.
 - **Existing videos** among the 30 newest get fresh views, likes and comments; Status is kept. Older videos stop being updated once they drop out of the 30 newest.
-- **Thumbnail** is saved as an image attachment (Airtable keeps its own copy), once: when a video is stored, or on the next scrape if the field is empty.
+- **Thumbnail** is saved as an image attachment in Media (Airtable keeps its own copy), once: when a video is stored, or on the next scrape if Media is empty.
 - **After a failure:** the channel is marked `error` with the reason and keeps its Last Scraped, so the next daily run retries it.
 - **Cost:** 1 credit per channel every 3 days (about 10 a month per channel), plus 1 when a channel is added.
 
