@@ -1,6 +1,6 @@
 name: Tests
 
-# Offline tests: twitterapi.io and Airtable are faked, so no secrets and no credits are used.
+# Offline tests: twitterapi.io, ScrapeCreators and Airtable are faked, so no secrets and no credits are used.
 on:
   push:
   pull_request:
@@ -25,6 +25,10 @@ jobs:
         run: python3 tests/test_youtube.py
       - name: Reddit tests
         run: python3 tests/test_reddit.py
+      - name: Instagram tests
+        run: python3 tests/test_instagram.py
+      - name: All scrapers into Scraped Content
+        run: python3 tests/test_scraped_content.py
       - name: Malformed data
         run: python3 tests/fuzz_x.py
       - name: 30-day simulations

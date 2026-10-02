@@ -75,6 +75,7 @@ class FakeAT:
     def __init__(self, accounts, posts=(), fail_post=False):
         self.accounts = {a["id"]: copy.deepcopy(a) for a in accounts}
         self.posts, self.writes, self.lookups, self.full_loads, self.fail_post = list(posts), [], [], 0, fail_post
+        self.platforms = set()
 
     def __call__(self, method, table, params=None, body=None):
         if method == "GET" and table == rd.ACCOUNTS:
@@ -85,9 +86,13 @@ class FakeAT:
             self.full_loads += 1
             return {"records": copy.deepcopy(self.posts)}
         if table == f"{rd.POSTS}/listRecords":
-            ids = re.findall(r"='([^']*)'", body["filterByFormula"])
+            m = re.fullmatch(r"AND\(\{%s\}='(\w+)',OR\((.*)\)\)" % rd.P_PLATFORM, body["filterByFormula"])
+            assert m, body["filterByFormula"]
+            ids = re.findall(r"\{%s\}='([^']*)'" % rd.P_CONTENT_ID, m.group(2))
             self.lookups.append(ids)
-            return {"records": [copy.deepcopy(p) for p in self.posts if p["fields"].get(rd.P_POST_ID) in ids]}
+            self.platforms.add(m.group(1))
+            return {"records": [copy.deepcopy(p) for p in self.posts if p["fields"].get(rd.P_CONTENT_ID) in ids
+                                and p["fields"].get(rd.P_PLATFORM) == m.group(1)]}
         if table == f"{rd.ACCOUNTS}/listRecords":
             formula = body["filterByFormula"]
             field, value = re.search(r"LOWER\(\{(\w+)\}\)='([^']*)'", formula).groups()
@@ -135,13 +140,13 @@ sc, at = FakeSC(day=day, week=[post("w1", 100)]), FakeAT([sub_row(last=NOW - tim
 code, out = run(sc, at)
 check("daily: exit 0, one call, top of the day", code == 0 and sc.calls == [
     ("/v1/reddit/subreddit", {"subreddit": "ClaudeAI", "sort": "top", "timeframe": "day"})])
-check("daily: all returned posts created as New", {r["fields"][rd.P_POST_ID] for r in at.posted()} == {"a1", "a2", "a3", "a4"}
+check("daily: all returned posts created as New", {r["fields"][rd.P_CONTENT_ID] for r in at.posted()} == {"a1", "a2", "a3", "a4"}
       and all(r["fields"][rd.P_STATUS] == "New" for r in at.posted()))
-m = {r["fields"][rd.P_POST_ID]: r["fields"].get(rd.P_MEDIA, []) for r in at.posted()}
+m = {r["fields"][rd.P_CONTENT_ID]: r["fields"].get(rd.P_MEDIA, []) for r in at.posted()}
 check("media: image attached, video = best video + audio, gallery/text none", [f["filename"] for f in m["a2"]] == ["a2.png"]
       and [f["url"] for f in m["a3"]] == ["https://v.redd.it/zvcc/CMAF_720.mp4", "https://v.redd.it/zvcc/CMAF_AUDIO_128.mp4"]
       and m["a1"] == [] and m["a4"] == [])
-c = next(r["fields"] for r in at.posted() if r["fields"][rd.P_POST_ID] == "a1")
+c = next(r["fields"] for r in at.posted() if r["fields"][rd.P_CONTENT_ID] == "a1")
 check("mapping: thread URL from permalink, UTC date, ratio 0-1", c[rd.P_URL] == "https://www.reddit.com/r/ClaudeAI/comments/a1/post/"
       and c[rd.P_PUBLISHED] == iso(NOW - timedelta(hours=2)) and c[rd.P_UPVOTE_RATIO] == 0.95 and c[rd.P_ACCOUNT] == ["recSUB000000000AA"])
 a = at.account()
@@ -151,15 +156,54 @@ check("table never loaded in full; only returned IDs looked up", at.full_loads =
 check("summary shows the timeframe", "top of the day" in out)
 
 # 2. Seen again: updated, Status kept, media only filled when empty
-stored = [{"id": "recA1", "fields": {rd.P_POST_ID: "a1", rd.P_STATUS: "Reviewed"}},
-          {"id": "recA2", "fields": {rd.P_POST_ID: "a2", rd.P_MEDIA: [{"id": "att1"}]}},
-          {"id": "recA3", "fields": {rd.P_POST_ID: "a3"}}]
+stored = [{"id": "recA1", "fields": {rd.P_CONTENT_ID: "a1", rd.P_PLATFORM: "Reddit", rd.P_STATUS: "Reviewed"}},
+          {"id": "recA2", "fields": {rd.P_CONTENT_ID: "a2", rd.P_PLATFORM: "Reddit", rd.P_MEDIA: [{"id": "att1"}]}},
+          {"id": "recA3", "fields": {rd.P_CONTENT_ID: "a3", rd.P_PLATFORM: "Reddit"}}]
 sc, at = FakeSC(day=[post("a1", 2, score=900), day[1], day[2]]), FakeAT([sub_row(last=NOW - timedelta(days=1))], stored)
 run(sc, at)
 up = {r["id"]: r["fields"] for r in at.patched()}
 check("seen again: updated, new score, no Status, no duplicate", set(up) == {"recA1", "recA2", "recA3"} and up["recA1"][rd.P_SCORE] == 900
       and all(rd.P_STATUS not in f for f in up.values()) and at.posted() == [])
 check("seen again: filled media not re-sent, empty media filled", rd.P_MEDIA not in up["recA2"] and len(up["recA3"][rd.P_MEDIA]) == 2)
+
+# 2b. Scraped Content: one table for every platform
+sc, at = FakeSC(day=day), FakeAT([sub_row(last=NOW - timedelta(days=1))])
+run(sc, at)
+got = {r["fields"][rd.P_CONTENT_ID]: r["fields"] for r in at.posted()}
+check("content: writes go to Scraped Content and Accounts only", {t for _, t, _ in at.writes} == {rd.POSTS, rd.ACCOUNTS}
+      and rd.POSTS == "tblViAU74E50jTA5H")
+check("content: Platform Reddit on every post", all(f[rd.P_PLATFORM] == "Reddit" for f in got.values()))
+check("content: types text/image/video/gallery", {k: f[rd.P_TYPE] for k, f in got.items()}
+      == {"a1": "Text", "a2": "Photo", "a3": "Video", "a4": "Gallery"})
+c = got["a1"]
+check("content: Title, Text = selftext, Author, Flair, Score, Comments", c[rd.P_TITLE] == "Post a1" and c[rd.P_TEXT] == "body"
+      and c[rd.P_AUTHOR] == "someone" and c[rd.P_FLAIR] == "Discussion" and c[rd.P_SCORE] == 100 and c[rd.P_COMMENTS] == 12)
+check("content: lookups only among Reddit rows", at.platforms == {"Reddit"})
+type_cases = [  # (post_hint, url, extra fields) -> Type, as ScrapeCreators returns them
+    (("text", None, {"domain": "self.ClaudeAI"}), "Text"),
+    (("multi_media", None, {"domain": "self.ClaudeAI"}), "Text"),
+    (("image", "https://i.redd.it/x.jpeg", {"domain": "i.redd.it"}), "Photo"),
+    (("video", "https://v.redd.it/abc", {"is_video": True}), "Video"),
+    (("hosted:video", "https://v.redd.it/abc", {}), "Video"),
+    (("gallery", "https://www.reddit.com/gallery/1abc", {}), "Gallery"),
+    (("link", "https://example.com/article", {"domain": "example.com"}), "Link"),
+    (("rich:video", "https://www.youtube.com/watch?v=x", {"domain": "youtube.com"}), "Link"),
+    ((None, "https://github.com/x/y", {"domain": "github.com"}), "Link"),
+    ((None, None, {"is_self": True}), "Text"),
+    ((None, "https://i.redd.it/y.png", {}), "Photo"),
+    ((None, "https://www.reddit.com/gallery/zz", {}), "Gallery"),
+]
+for (hint, url, extra), want in type_cases:
+    p_ = post("t", hint=hint, url=url, **extra)
+    if url is None:
+        p_["url"] = f"https://www.reddit.com/r/ClaudeAI/comments/t/post/"
+    check(f"type {want} for hint={hint} url={url}", rd.post_type(p_) == want)
+check("type: a post with no hint, url or domain is a Link, no crash", rd.post_type({"id": "z"}) == "Link"
+      and rd.post_type({"id": "z", "url": None, "domain": None}) == "Link")
+same = [{"id": "recIG", "fields": {rd.P_CONTENT_ID: "a1", rd.P_PLATFORM: "Instagram", rd.P_STATUS: "Reviewed"}}]
+sc, at = FakeSC(day=[day[0]]), FakeAT([sub_row(last=NOW - timedelta(days=1))], same)
+run(sc, at)
+check("content: an Instagram row with the same ID is left alone; the post is created", at.patched() == [] and len(at.posted()) == 1)
 
 # 3. Timeframes: week for a new subreddit and after missed days, day otherwise
 check("timeframe: new -> week", rd.timeframe_for(sub_row(), NOW) == "week")
@@ -169,7 +213,7 @@ check("timeframe: 2 days ago (a missed day) -> week", rd.timeframe_for(sub_row(l
 sc, at = FakeSC(day=day, week=[post("w1", 100), post("w2", 150)]), FakeAT([sub_row()])
 code, out = run(sc, at)
 check("new subreddit on the daily run: top of the week", sc.calls[0][1]["timeframe"] == "week"
-      and {r["fields"][rd.P_POST_ID] for r in at.posted()} == {"w1", "w2"} and "top of the week" in out)
+      and {r["fields"][rd.P_CONTENT_ID] for r in at.posted()} == {"w1", "w2"} and "top of the week" in out)
 
 # 4. --new-accounts: only subreddits with no Last Scraped, top of the week, once
 rows = [sub_row(), sub_row("recOLD000000000AA", last=NOW - timedelta(days=1), handle="LocalLLaMA"),

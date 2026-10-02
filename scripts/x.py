@@ -19,11 +19,13 @@ Runs every 6 hours. For the Accounts rows with Scrape = Active and Platform = X:
      repeated page. A query that hits MAX_PAGES continues with the older rest of its slice,
      within MAX_CALLS_PER_BATCH calls per run. twitterapi.io 429 / 5xx / network errors are
      retried once.
-  2. Create new tweets in X Posts (Status = New, Media), matched to their account by the
-     author's user ID (saved to an empty Platform ID), else by handle. Only the returned Tweet
-     IDs are looked up in Airtable. Tweets seen again (the overlap) are updated except Status,
-     so "Reviewed" marks are kept. Quote tweets, replies and retweets are skipped. Media is
-     only sent when the stored field is empty.
+  2. Create new tweets in Scraped Content (Platform = X, Content ID = Tweet ID, Status = New,
+     Media), matched to their account by the author's user ID (saved to an empty Platform ID),
+     else by handle. Title = the tweet's first line; Type = Video / Photo / Text from its
+     media. Only the returned Tweet IDs are looked up in Airtable, among the X rows. Tweets
+     seen again (the overlap) are updated except Status, so "Reviewed" marks are kept. Quote
+     tweets, replies and retweets are skipped. Media is only sent when the stored field is
+     empty.
   3. On each account: Last Scraped = end of the last fully read and saved slice (never moved
      past anything unread), Last Scrape Status, Scrape Error.
 Only one run at a time: a second run started while one is going exits (lock file).
@@ -66,22 +68,27 @@ A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
 A_LAST_STATUS = "flduqhmL46oI0XJPo"
 A_SCRAPE_ERROR = "flde8rfQchM6wk7Ho"
 
-# X Posts tblA1bdKffknF94aW
-POSTS = "tblA1bdKffknF94aW"
-P_TEXT = "fld5ofchYsjcFqFNg"
-P_TWEET_ID = "fldgNotkqXPybn8TR"
-P_ACCOUNT = "fldEERZVJ8pXjOXDs"
-P_URL = "fld0zTtCEvLKLFdvR"
-P_PUBLISHED = "fldF9lh8M6zFgT0in"
-P_VIEWS = "fldWnMGkOcpxFGHiC"
-P_LIKES = "fldycGNHIr7D3z3Dv"
-P_COMMENTS = "fldF0ZE8S1fd61Grn"
-P_REPOSTS = "fld4rPNGljHg0ZCyp"
-P_QUOTES = "fldHAdZg0PFwfi1yT"
-P_BOOKMARKS = "fldtG96YoM3RS8Z7k"
-P_MEDIA = "fldp6WngAiPjfzOfD"
-P_STATUS = "fldzDBcbEeiojh8ct"
-P_LAST_SCRAPED = "fldGGg2QCSALoXka0"
+# Scraped Content tblViAU74E50jTA5H: one table for every platform; rows match on
+# Platform + Content ID (here the Tweet ID)
+POSTS = "tblViAU74E50jTA5H"
+P_CONTENT_ID = "fldQo17O1tcoje3HB"
+P_TITLE = "fldNkd3XzlbpdNPW6"
+P_PLATFORM = "fld79CFY4T9xkiA6Q"
+P_ACCOUNT = "fldn8KHcs9SurgWBE"
+P_URL = "fldQRzqXqCWMbYaLD"
+P_TYPE = "fld4g5cokEPmzaoVA"
+P_TEXT = "fldkuaPl7DjFmlj7o"
+P_PUBLISHED = "fldTdsMUfOHYCkmVP"
+P_VIEWS = "fldoJ7VfdRHC78CeJ"
+P_LIKES = "fldBybnTMpW6Egc3O"
+P_COMMENTS = "fldPIA6Zm9Rib9Xe8"
+P_REPOSTS = "fldTzcMOI6pTw6L08"
+P_QUOTES = "fldOVfFBrh8tG84a5"
+P_BOOKMARKS = "fldnpgk0h2RfSSsJX"
+P_MEDIA = "fld0CsTd3XkegpUEP"
+P_STATUS = "fld2D5rCtlEW9w2Hn"
+P_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
+PLATFORM = "X"  # the Platform value of this script's rows
 
 RUN_HOURS = 6             # schedule interval
 WINDOW_HOURS = 8          # each scheduled run reads at least the last 8 hours
@@ -103,6 +110,7 @@ MIN_CREDITS_PER_CALL = 15
 
 BATCH = 10  # Airtable's max records per write request
 MAX_TEXT = 100000  # Airtable's long text limit
+TITLE_CHARS = 100  # Title = the first line of the tweet, cut to this length
 
 
 class HttpError(Exception):
@@ -358,12 +366,31 @@ def media_files(tweet):
     return files
 
 
+def tweet_type(tweet):
+    """Type: Video if the tweet has a video or GIF, else Photo if it has a photo, else Text."""
+    media = tweet.get("extendedEntities")
+    media = media.get("media") if isinstance(media, dict) else None
+    kinds = {m.get("type") for m in media if isinstance(m, dict)} if isinstance(media, list) else set()
+    if kinds & {"video", "animated_gif"}:
+        return "Video"
+    return "Photo" if "photo" in kinds else "Text"
+
+
+def first_line(text):
+    """The first non-empty line of `text`, cut to TITLE_CHARS (None if there is none)."""
+    return next((line.strip()[:TITLE_CHARS] for line in text.splitlines() if line.strip()), None)
+
+
 def post_fields(tweet, account_id, now, existing=None):
     """Airtable fields for one tweet (Media is added separately). `existing` is None for a
     new tweet, otherwise the stored record's info. Status only on create, never on update."""
+    text = html.unescape(str(tweet.get("text") or ""))[:MAX_TEXT]
     fields = {
-        P_TEXT: html.unescape(str(tweet.get("text") or ""))[:MAX_TEXT] or None,
-        P_TWEET_ID: tweet.get("id"),
+        P_CONTENT_ID: tweet.get("id"),
+        P_TITLE: first_line(text),
+        P_PLATFORM: PLATFORM,
+        P_TYPE: tweet_type(tweet),
+        P_TEXT: text or None,
         P_ACCOUNT: [account_id],
         P_URL: tweet.get("url") if isinstance(tweet.get("url"), str) else None,
         P_PUBLISHED: iso(parse_created(tweet.get("createdAt"))),
@@ -434,21 +461,21 @@ def slices(since, until):
 
 
 def lookup_existing(ids, known):
-    """Look up in X Posts only the given tweet IDs not yet in `known` (tweet ID -> {"id",
-    "media"}, or None when not in Airtable), LOOKUP_CHUNK IDs per filtered query, instead of
-    loading the whole table."""
+    """Look up in Scraped Content only the given tweet IDs not yet in `known` (tweet ID ->
+    {"id", "media"}, or None when not in Airtable), among the X rows only, LOOKUP_CHUNK IDs per
+    filtered query, instead of loading the whole table."""
     todo = [i for i in dict.fromkeys(ids) if i not in known]
     for i in range(0, len(todo), LOOKUP_CHUNK):
         chunk = todo[i:i + LOOKUP_CHUNK]
-        quoted = ",".join("{%s}='%s'" % (P_TWEET_ID, t.replace("\\", "\\\\").replace("'", "\\'")) for t in chunk)
-        body = {"filterByFormula": f"OR({quoted})", "fields": [P_TWEET_ID, P_MEDIA],
+        quoted = ",".join("{%s}='%s'" % (P_CONTENT_ID, t.replace("\\", "\\\\").replace("'", "\\'")) for t in chunk)
+        body = {"filterByFormula": f"AND({{{P_PLATFORM}}}='{PLATFORM}',OR({quoted}))", "fields": [P_CONTENT_ID, P_MEDIA],
                 "returnFieldsByFieldId": True, "pageSize": 100}
         for tid in chunk:
             known[tid] = None
         while True:
             page = airtable("POST", f"{POSTS}/listRecords", body=body)
             for r in page.get("records", []):
-                tid = r["fields"].get(P_TWEET_ID)
+                tid = r["fields"].get(P_CONTENT_ID)
                 if tid in known and known[tid] is None:
                     # Empty attachment fields are left out of Airtable's response: presence = filled.
                     known[tid] = {"id": r["id"], "media": bool(r["fields"].get(P_MEDIA))}
@@ -459,7 +486,7 @@ def lookup_existing(ids, known):
 
 def save_tweets(tweets, accounts, handles, known, now, per, batch, pid_updates):
     """Match one read's tweets to the batch's accounts, skip non-originals, and create or
-    update them in X Posts. Returns the problems to flag. Raises if an Airtable write fails
+    update them in Scraped Content. Returns the problems to flag. Raises if an Airtable write fails
     (other than a 422, which is retried one record at a time)."""
     by_id = {str(a["fields"].get(A_PLATFORM_ID) or "").strip(): a for a in accounts}
     by_id.pop("", None)
@@ -528,14 +555,14 @@ def save_tweets(tweets, accounts, handles, known, now, per, batch, pid_updates):
                         if e1.code != 422:
                             raise
                         per[one["fields"][P_ACCOUNT][0]]["bad"].append(
-                            f"{one['fields'][P_TWEET_ID]} (Airtable rejected it: {e1})")
+                            f"{one['fields'][P_CONTENT_ID]} (Airtable rejected it: {e1})")
             for sent, rec in pairs:
                 st = per[sent["fields"][P_ACCOUNT][0]]
                 st[key] += 1
                 st["media_added"] += len(sent["fields"].get(P_MEDIA, []))
-                info = known.get(sent["fields"][P_TWEET_ID]) or {"id": rec["id"], "media": False}
+                info = known.get(sent["fields"][P_CONTENT_ID]) or {"id": rec["id"], "media": False}
                 info["media"] = info["media"] or P_MEDIA in sent["fields"]
-                known[sent["fields"][P_TWEET_ID]] = info
+                known[sent["fields"][P_CONTENT_ID]] = info
     return problems
 
 

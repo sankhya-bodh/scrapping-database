@@ -86,9 +86,17 @@ class WorldTW:
         return {"tweets": copy.deepcopy(page), "has_next_page": bool(page), "next_cursor": str(off + 20) if page else ""}
 
 
+def parse_lookup(formula):
+    """The Platform and Content IDs of a Scraped Content lookup; fails on any other shape."""
+    m = re.fullmatch(r"AND\(\{%s\}='(\w+)',OR\((.*)\)\)" % x.P_PLATFORM, formula)
+    assert m, formula
+    ids = re.findall(r"\{%s\}='((?:[^'\\]|\\.)*)'" % x.P_CONTENT_ID, m.group(2))
+    return m.group(1), [i.replace("\\'", "'").replace("\\\\", "\\") for i in ids]
+
+
 class FakeAT:
     def __init__(self, accounts, posts=(), fail_post=False, reject_id=None):
-        self.accounts, self.posts, self.writes, self.lookups = accounts, list(posts), [], []
+        self.accounts, self.posts, self.writes, self.lookups, self.platforms = accounts, list(posts), [], [], set()
         self.fail_post, self.reject_id, self.n, self.full_loads = fail_post, reject_id, 0, 0
 
     def __call__(self, method, table, params=None, body=None):
@@ -97,13 +105,15 @@ class FakeAT:
                 self.full_loads += 1
             return {"records": copy.deepcopy(self.accounts if table == x.ACCOUNTS else self.posts)}
         if table == f"{x.POSTS}/listRecords":
-            ids = [i.replace("\\'", "'") for i in re.findall(r"='((?:[^'\\]|\\.)*)'", body["filterByFormula"])]
+            platform, ids = parse_lookup(body["filterByFormula"])
             self.lookups.append(ids)
-            return {"records": [copy.deepcopy(p) for p in self.posts if p["fields"].get(x.P_TWEET_ID) in ids]}
+            self.platforms.add(platform)
+            return {"records": [copy.deepcopy(p) for p in self.posts if p["fields"].get(x.P_CONTENT_ID) in ids
+                                and p["fields"].get(x.P_PLATFORM) == platform]}
         self.writes.append((method, table, copy.deepcopy(body)))
         if table == x.POSTS and method == "POST" and self.fail_post:
             raise x.HttpError("HTTP 503 from /v0: down", 503)
-        if table == x.POSTS and self.reject_id and any(r["fields"].get(x.P_TWEET_ID) == self.reject_id for r in body["records"]):
+        if table == x.POSTS and self.reject_id and any(r["fields"].get(x.P_CONTENT_ID) == self.reject_id for r in body["records"]):
             raise x.HttpError('HTTP 422 from /v0: {"error":{"type":"INVALID_VALUE_FOR_COLUMN"}}', 422)
         out = []
         for r in body["records"]:
@@ -162,8 +172,8 @@ check("new account: last 24 hours exactly, in 3 slices", until - since == 24 * 3
       and len({q_times(p) for p in tw.params}) == 3)
 posts = at.posted()
 check("#8 quote tweets skipped, 2 originals created", len(posts) == 2 and "2 quote/reply/retweet skipped" in out
-      and not {q["id"] for q in quotes} & {r["fields"][x.P_TWEET_ID] for r in posts})
-c = next(r["fields"] for r in posts if r["fields"][x.P_TWEET_ID] == "2000000000000000002")
+      and not {q["id"] for q in quotes} & {r["fields"][x.P_CONTENT_ID] for r in posts})
+c = next(r["fields"] for r in posts if r["fields"][x.P_CONTENT_ID] == "2000000000000000002")
 check("mapping", c[x.P_PUBLISHED] == "2026-09-23T10:36:09.000Z" and c[x.P_URL].endswith("/2000000000000000002")
       and (c[x.P_VIEWS], c[x.P_LIKES], c[x.P_COMMENTS], c[x.P_REPOSTS], c[x.P_QUOTES], c[x.P_BOOKMARKS]) == (8519, 185, 33, 3, 3, 41))
 check("linked, Status New, html unescaped", c[x.P_ACCOUNT] == ["recEP"] and c[x.P_STATUS] == "New"
@@ -174,10 +184,10 @@ check("#7 success clears Scrape Error (sends null)", x.A_SCRAPE_ERROR in u and u
 check("est credits 105 (4 tweets + 3 empty pages)", "est. credits 105" in out)
 
 # 2. #4 Only the returned Tweet IDs are looked up; the table is never loaded
-check("#4 X Posts table not loaded", at.full_loads == 0)
+check("#4 Scraped Content table not loaded", at.full_loads == 0)
 check("#4 one lookup, only the 2 original IDs", at.lookups == [["2000000000000000002", "2000000000000000004"]])
-stored = [{"id": "recOLD", "fields": {x.P_TWEET_ID: originals[0]["id"], x.P_ACCOUNT: ["recEP"]}},
-          {"id": "recOTHER", "fields": {x.P_TWEET_ID: "unrelated"}}]
+stored = [{"id": "recOLD", "fields": {x.P_CONTENT_ID: originals[0]["id"], x.P_PLATFORM: "X", x.P_ACCOUNT: ["recEP"]}},
+          {"id": "recOTHER", "fields": {x.P_CONTENT_ID: "unrelated", x.P_PLATFORM: "X"}}]
 tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([EP], stored)
 run(tw, at)
 up = at.patched()
@@ -187,7 +197,7 @@ many = [tweet(str(70000 + i), EP_ID, "example_user", NOW - timedelta(minutes=i +
 tw, at = WorldTW(many), FakeAT([EP])
 run(tw, at)
 check("#4 lookups chunked by 50", [len(l) for l in at.lookups] == [50, 50, 20] and len(at.posted()) == 120)
-check("#4 quote in lookup formula escaped", "\\'" in "{%s}='%s'" % (x.P_TWEET_ID, "a'b".replace("'", "\\'")))
+check("#4 quote in lookup formula escaped", "\\'" in "{%s}='%s'" % (x.P_CONTENT_ID, "a'b".replace("'", "\\'")))
 
 # 3. Window rules
 def ws(accounts):
@@ -226,7 +236,7 @@ late = acc("recEP", "example_user", EP_ID, iso(NOW - 5 * H6), "error")  # 30h be
 busy = [tweet(str(80000 + i), EP_ID, "example_user", NOW - timedelta(minutes=5 * i + 1)) for i in range(350)]  # 350 in ~29h
 tw, at = WorldTW(busy), FakeAT([late])
 code, out = run(tw, at)
-got = {r["fields"][x.P_TWEET_ID] for r in at.posted()}
+got = {r["fields"][x.P_CONTENT_ID] for r in at.posted()}
 u = at.account_updates()["recEP"]
 check("#1 350 tweets in a 30h catch-up: all saved", len(got) == 350 and len(at.posted()) == 350)
 check("#1 slices read oldest first", q_times(tw.params[0])[0] == int((NOW - 5 * H6 - M15).timestamp()))
@@ -245,14 +255,14 @@ u = at.account_updates()["recEP"]
 covered = x.parse_iso(u.get(x.A_LAST_SCRAPED))
 check("#1 budget: at most MAX_CALLS_PER_BATCH calls", tw.calls <= x.MAX_CALLS_PER_BATCH)
 check("#1 budget: Last Scraped moves only to the end of the last full slice", covered is not None and covered < NOW
-      and all(x.parse_created(t["createdAt"]) >= covered or t["id"] in {r["fields"][x.P_TWEET_ID] for r in at.posted()} for t in huge
+      and all(x.parse_created(t["createdAt"]) >= covered or t["id"] in {r["fields"][x.P_CONTENT_ID] for r in at.posted()} for t in huge
               if x.parse_created(t["createdAt"]) < covered and x.parse_created(t["createdAt"]) >= NOW - timedelta(hours=71, minutes=15)))
 check("#1 budget: noted, not an error", u[x.A_LAST_STATUS] == "ok" and "continues next run" in out)
 at.accounts[0]["fields"][x.A_LAST_SCRAPED] = u[x.A_LAST_SCRAPED]
 for _ in range(5):
     at.accounts[0]["fields"].update(at.account_updates()["recEP"])
     tw2 = WorldTW(huge); at.writes.clear(); run(tw2, at)
-got = {p["fields"][x.P_TWEET_ID] for p in at.posts}
+got = {p["fields"][x.P_CONTENT_ID] for p in at.posts}
 check("#1 budget: later runs finish the catch-up, nothing lost", all(t["id"] in got for t in huge
       if x.parse_created(t["createdAt"]) >= NOW - timedelta(hours=71, minutes=15)))
 
@@ -299,7 +309,7 @@ t_h = tweet("t2", "999999", "USER2", NOW - timedelta(hours=2))
 t_other = tweet("t3", "555", "stranger", NOW - timedelta(hours=1))
 tw, at = FakeTW([{"tweets": [t_id, t_h, t_other], "has_next_page": False}]), FakeAT(accs)
 run(tw, at)
-posts = {r["fields"][x.P_TWEET_ID]: r["fields"][x.P_ACCOUNT] for r in at.posted()}
+posts = {r["fields"][x.P_CONTENT_ID]: r["fields"][x.P_ACCOUNT] for r in at.posted()}
 check("match by author id, then handle; stranger skipped + flagged", posts == {"t1": ["rec1"], "t2": ["rec2"]}
       and "author not one of" in at.account_updates()["rec0"][x.A_SCRAPE_ERROR])
 
@@ -312,10 +322,10 @@ files = x.media_files(tm)
 best = max((v for v in vid["video_info"]["variants"] if v["content_type"] == "video/mp4"), key=lambda v: v["bitrate"])
 check("media: photo orig, best mp4, gif", len(files) == 3 and files[0]["url"].endswith("ABC.png?name=orig") and files[1]["url"] == best["url"])
 page = {"tweets": [tm], "has_next_page": False}
-tw, at = FakeTW([page]), FakeAT([EP], [{"id": "recM", "fields": {x.P_TWEET_ID: "555", x.P_MEDIA: [{"id": "att"}]}}])
+tw, at = FakeTW([page]), FakeAT([EP], [{"id": "recM", "fields": {x.P_CONTENT_ID: "555", x.P_PLATFORM: "X", x.P_MEDIA: [{"id": "att"}]}}])
 run(tw, at)
 check("filled media not re-sent", x.P_MEDIA not in at.patched()[0]["fields"])
-tw, at = FakeTW([page]), FakeAT([EP], [{"id": "recM", "fields": {x.P_TWEET_ID: "555"}}])
+tw, at = FakeTW([page]), FakeAT([EP], [{"id": "recM", "fields": {x.P_CONTENT_ID: "555", x.P_PLATFORM: "X"}}])
 run(tw, at)
 check("empty media backfilled", len(at.patched()[0]["fields"].get(x.P_MEDIA, [])) == 3)
 tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([acc("recEP", "example_user", EP_ID, iso(prev), "ok")], fail_post=True)
@@ -326,7 +336,7 @@ twelve = [tweet(str(9000 + i), EP_ID, "example_user", NOW - timedelta(minutes=i 
 tw, at = FakeTW([{"tweets": twelve, "has_next_page": False}]), FakeAT([acc("recEP", "example_user", EP_ID, iso(prev), "ok")], reject_id="9003")
 code, out = run(tw, at)
 u = at.account_updates()["recEP"]
-check("422: other 11 saved, bad one flagged, window advances", len({r["fields"][x.P_TWEET_ID] for r in at.posted()} - {"9003"}) == 11
+check("422: other 11 saved, bad one flagged, window advances", len({r["fields"][x.P_CONTENT_ID] for r in at.posted()} - {"9003"}) == 11
       and "9003 (Airtable rejected it" in u[x.A_SCRAPE_ERROR] and u[x.A_LAST_SCRAPED] == iso(NOW))
 x.twitterapi = FakeTW([{"tweets": twelve[:4], "has_next_page": True, "next_cursor": "s"}, {"tweets": twelve[4:7], "has_next_page": False}])
 tws, calls, _, inc = x.fetch_tweets(["example_user"], 0, 1)
@@ -356,7 +366,7 @@ ups = at.account_updates()
 check("new-accounts: only new (and >72h stale) accounts read, in one batch", code == 0
       and all("old_user" not in p["query"] and "paused1" not in p["query"] for p in tw.params)
       and all("example_user" in p["query"] and "back_user" in p["query"] for p in tw.params))
-check("new-accounts: last 24 hours only", {r["fields"][x.P_TWEET_ID] for r in at.posted()} == {"n1", "n2"}
+check("new-accounts: last 24 hours only", {r["fields"][x.P_CONTENT_ID] for r in at.posted()} == {"n1", "n2"}
       and q_times(tw.params[0])[0] == int((NOW - timedelta(hours=24)).timestamp()))
 check("new-accounts: Last Scraped = run time; other accounts untouched", set(ups) == {"recEP", "recSTALE"}
       and ups["recEP"][x.A_LAST_SCRAPED] == iso(NOW) and ups["recEP"][x.A_LAST_STATUS] == "ok")
@@ -371,14 +381,61 @@ check("new-accounts: first read fails -> error, Last Scraped = 24h back", code =
 at.accounts[0]["fields"].update(u)
 tw = WorldTW(fresh); at.writes.clear()
 code, out = run(tw, at)
-check("new-accounts: next scheduled run reads the full 24h", code == 0 and {r["fields"][x.P_TWEET_ID] for r in at.posted()} == {"n1", "n2"}
+check("new-accounts: next scheduled run reads the full 24h", code == 0 and {r["fields"][x.P_CONTENT_ID] for r in at.posted()} == {"n1", "n2"}
       and q_times(tw.params[0])[0] == int((NOW - timedelta(hours=24) - M15).timestamp()))
 at.accounts[0]["fields"].update(at.account_updates()["recEP"])
 tw = WorldTW(fresh)
 code, out = run(tw, at, new_accounts=True)
 check("new-accounts: once read, a later webhook run skips it", code == 0 and tw.calls == 0)
 
-# 10. #6 Single-flight lock
+# 10. Scraped Content: one table for every platform
+tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([EP])
+run(tw, at)
+posts = at.posted()
+check("content: writes go to Scraped Content and Accounts only", {t for _, t, _ in at.writes} == {x.POSTS, x.ACCOUNTS}
+      and x.POSTS == "tblViAU74E50jTA5H")
+check("content: every tweet has Platform X and Content ID = Tweet ID", all(r["fields"][x.P_PLATFORM] == "X" for r in posts)
+      and {r["fields"][x.P_CONTENT_ID] for r in posts} == {"2000000000000000002", "2000000000000000004"})
+check("content: lookups only among X rows", at.platforms == {"X"})
+c = next(r["fields"] for r in posts if r["fields"][x.P_CONTENT_ID] == "2000000000000000002")
+first = next(l.strip() for l in x.html.unescape(c[x.P_TEXT]).splitlines() if l.strip())
+check("title: first line of the tweet, max 100 chars, no newline", c[x.P_TITLE] == first[:100] and "\n" not in c[x.P_TITLE]
+      and len(c[x.P_TITLE]) <= 100)
+t = tweet("t1", EP_ID, "example_user", NOW, text="\n\n  Line one &amp; more  \nline two")
+check("title: blank lines skipped, stripped, unescaped", x.post_fields(t, "r", iso(NOW))[x.P_TITLE] == "Line one & more")
+t = tweet("t1", EP_ID, "example_user", NOW, text="a" * 300)
+check("title: cut to 100", x.post_fields(t, "r", iso(NOW))[x.P_TITLE] == "a" * 100)
+for text in ("", None, "   \n \n"):
+    t = tweet("t1", EP_ID, "example_user", NOW, text=text)
+    check(f"title: none for text {text!r}", x.P_TITLE not in x.post_fields(t, "r", iso(NOW)))
+t = tweet("t1", EP_ID, "example_user", NOW, text="one two")
+check("title: unicode line separator ends the line", x.post_fields(t, "r", iso(NOW))[x.P_TITLE] == "one")
+photo = {"type": "photo", "media_url_https": "https://pbs.twimg.com/media/A.jpg"}
+types_ = {
+    "Text": [{}, {"media": []}, None, [], {"media": None}, {"media": "x"}, {"media": [None, "x"]}],
+    "Photo": [{"media": [photo]}, {"media": [photo, photo]}],
+    "Video": [{"media": [vid]}, {"media": [photo, vid]}, {"media": [{"type": "animated_gif"}]}],
+}
+for want, cases in types_.items():
+    for ee in cases:
+        t = tweet("t1", EP_ID, "example_user", NOW, extendedEntities=ee)
+        check(f"type {want} for {str(ee)[:40]}", x.post_fields(t, "r", iso(NOW))[x.P_TYPE] == want)
+check("type: values are Type options in Airtable", {"Text", "Photo", "Video"} <= {"Video", "Reel", "Photo", "Carousel", "Text", "Link", "Gallery"})
+# Another platform's row with the same Content ID is never matched or updated
+same = [{"id": "recYT", "fields": {x.P_CONTENT_ID: "2000000000000000002", x.P_PLATFORM: "YouTube", x.P_STATUS: "Reviewed"}}]
+tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([EP], same)
+run(tw, at)
+check("content: a YouTube row with the same ID is left alone; the tweet is created", at.patched() == []
+      and "2000000000000000002" in {r["fields"][x.P_CONTENT_ID] for r in at.posted()})
+# Update path: Platform/Title/Type are re-sent (unchanged), Status still never
+stored = [{"id": "recOLD", "fields": {x.P_CONTENT_ID: "2000000000000000002", x.P_PLATFORM: "X", x.P_STATUS: "Reviewed"}}]
+tw, at = FakeTW([SAMPLE, EMPTY]), FakeAT([EP], stored)
+run(tw, at)
+u = at.patched()[0]["fields"]
+check("update: Platform, Title, Type sent; Status not", u[x.P_PLATFORM] == "X" and x.P_TITLE in u and x.P_TYPE in u
+      and x.P_STATUS not in u)
+
+# 11. #6 Single-flight lock
 x.LOCK_FILE = x.Path(os.environ.get("TMPDIR", "/tmp")) / "x_scrape_test.lock"
 first = x.acquire_lock()
 second = x.acquire_lock()

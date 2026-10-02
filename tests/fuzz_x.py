@@ -76,7 +76,7 @@ bad_results = []
 for name, (k, v) in mutations.items():
     t = copy.deepcopy(BASE); t[k] = v
     status, err, posts = run([{"tweets": [t, good], "has_next_page": False}])
-    good_saved = isinstance(posts, list) and any(p["fields"].get(x.P_TWEET_ID) == "999" for p in posts)
+    good_saved = isinstance(posts, list) and any(p["fields"].get(x.P_CONTENT_ID) == "999" for p in posts)
     # Without author info a tweet can't be matched to an account: skipped + flagged is correct.
     expect = "error" if name in ("author None", "author str") else "ok"
     ok = status == expect and good_saved

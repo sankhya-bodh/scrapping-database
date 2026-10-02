@@ -73,6 +73,7 @@ class FakeAT:
     def __init__(self, accounts, videos=(), fail_post=False):
         self.accounts = {a["id"]: copy.deepcopy(a) for a in accounts}
         self.videos, self.writes, self.lookups, self.full_loads, self.fail_post = list(videos), [], [], 0, fail_post
+        self.platforms = set()
 
     def __call__(self, method, table, params=None, body=None):
         if method == "GET" and table == yt.ACCOUNTS:
@@ -83,9 +84,13 @@ class FakeAT:
             self.full_loads += 1
             return {"records": copy.deepcopy(self.videos)}
         if table == f"{yt.VIDEOS}/listRecords":
-            ids = re.findall(r"='([^']*)'", body["filterByFormula"])
+            m = re.fullmatch(r"AND\(\{%s\}='(\w+)',OR\((.*)\)\)" % yt.V_PLATFORM, body["filterByFormula"])
+            assert m, body["filterByFormula"]
+            ids = re.findall(r"\{%s\}='([^']*)'" % yt.V_CONTENT_ID, m.group(2))
             self.lookups.append(ids)
-            return {"records": [copy.deepcopy(v) for v in self.videos if v["fields"].get(yt.V_VIDEO_ID) in ids]}
+            self.platforms.add(m.group(1))
+            return {"records": [copy.deepcopy(v) for v in self.videos if v["fields"].get(yt.V_CONTENT_ID) in ids
+                                and v["fields"].get(yt.V_PLATFORM) == m.group(1)]}
         if table == f"{yt.ACCOUNTS}/listRecords":  # duplicate check in youtube_profile
             formula = body["filterByFormula"]
             field, value = re.search(r"LOWER\(\{(\w+)\}\)='([^']*)'", formula).groups()
@@ -129,11 +134,11 @@ sc, at = FakeSC(vids), FakeAT([channel_row()])
 code, out = run(sc, at)
 check("new channel: exit 0, one call, sort=latest + includeExtras", code == 0 and sc.calls == [
     ("/v1/youtube/channel-videos", {"channelId": CH, "sort": "latest", "includeExtras": "true"})])
-check("new channel: every returned video created, old ones too", {r["fields"][yt.V_VIDEO_ID] for r in at.posted()}
+check("new channel: every returned video created, old ones too", {r["fields"][yt.V_CONTENT_ID] for r in at.posted()}
       == {"new1", "new2", "old1", "old2"} and "created 4" in out)
 check("Shorts list ignored", "short1" not in str(at.writes))
 check("created: Status New, exact UTC date", all(r["fields"][yt.V_STATUS] == "New" for r in at.posted())
-      and next(r for r in at.posted() if r["fields"][yt.V_VIDEO_ID] == "new1")["fields"][yt.V_PUBLISHED] == iso(NOW - timedelta(days=0.5)))
+      and next(r for r in at.posted() if r["fields"][yt.V_CONTENT_ID] == "new1")["fields"][yt.V_PUBLISHED] == iso(NOW - timedelta(days=0.5)))
 a = at.account()
 check("success: Last Scraped = now, ok, error cleared", a[yt.A_LAST_SCRAPED] == iso(NOW) and a[yt.A_LAST_STATUS] == "ok"
       and yt.A_SCRAPE_ERROR in a and a[yt.A_SCRAPE_ERROR] is None)
@@ -151,36 +156,40 @@ check("not due: no call, no writes, exit 0", code == 0 and sc.calls == [] and at
 
 # 3. A scheduled run: every returned video not yet stored is created, every stored one refreshed
 last = NOW - timedelta(days=3)
-stored = [{"id": "recOLD1", "fields": {yt.V_VIDEO_ID: "old1", yt.V_STATUS: "Reviewed"}},
-          {"id": "recOLD2", "fields": {yt.V_VIDEO_ID: "old2"}}]
+stored = [{"id": "recOLD1", "fields": {yt.V_CONTENT_ID: "old1", yt.V_PLATFORM: "YouTube", yt.V_STATUS: "Reviewed"}},
+          {"id": "recOLD2", "fields": {yt.V_CONTENT_ID: "old2", yt.V_PLATFORM: "YouTube"}}]
 vids = [video("v_new", 1), video("v_late", 5.5), video("old1", 3.1, viewCountInt=5000), video("old2", 40, viewCountInt=9),
         video("v_before", 7)]
 sc, at = FakeSC(vids), FakeAT([channel_row(last=last)], stored)
 code, out = run(sc, at)
 check("scheduled: every video not yet stored created (late-public and older ones too)",
-      {r["fields"][yt.V_VIDEO_ID] for r in at.posted()} == {"v_new", "v_late", "v_before"})
+      {r["fields"][yt.V_CONTENT_ID] for r in at.posted()} == {"v_new", "v_late", "v_before"})
 up = {r["id"]: r["fields"] for r in at.patched()}
 check("scheduled: every stored video refreshed, any age", set(up) == {"recOLD1", "recOLD2"} and up["recOLD1"][yt.V_VIEWS] == 5000
       and up["recOLD2"][yt.V_VIEWS] == 9)
 check("scheduled: Status never sent on update (Reviewed kept)", all(yt.V_STATUS not in f for f in up.values()))
 check("scheduled: Last Scraped = now", at.account()[yt.A_LAST_SCRAPED] == iso(NOW))
 code, out = run(FakeSC(vids), at)
-check("running again: no duplicates", len([v for v in at.videos if v["fields"].get(yt.V_VIDEO_ID) == "v_new"]) == 1)
+check("running again: no duplicates", len([v for v in at.videos if v["fields"].get(yt.V_CONTENT_ID) == "v_new"]) == 1)
 
-# 3b. Thumbnail saved as an attachment, once; the old URL field isn't written
+# 3b. Thumbnail saved as an attachment, once
 sc, at = FakeSC([video("t1", 1, thumbnail="https://i.ytimg.com/vi/t1/hq720.jpg?sqp=-oaymwEnCNAF&rs=AOn4CL")]), FakeAT([channel_row()])
 code, out = run(sc, at)
 c = at.posted()[0]["fields"]  # the query (which makes YouTube serve AVIF) is dropped: JPEG
 check("thumbnail: attached on create, named by video ID", c.get(yt.V_THUMBNAIL) == [
     {"url": "https://i.ytimg.com/vi/t1/hq720.jpg", "filename": "t1.jpg"}] and "thumbnails saved 1" in out)
-check("thumbnail: the deleted Thumbnail URL field is never written", "fld0qq4zJ1dTzJqtL" not in str(at.writes))
-stored = [{"id": "recT1", "fields": {yt.V_VIDEO_ID: "t1"}},
-          {"id": "recT2", "fields": {yt.V_VIDEO_ID: "t2", yt.V_THUMBNAIL: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
+stored = [{"id": "recT1", "fields": {yt.V_CONTENT_ID: "t1", yt.V_PLATFORM: "YouTube"}},
+          {"id": "recT2", "fields": {yt.V_CONTENT_ID: "t2", yt.V_PLATFORM: "YouTube", yt.V_THUMBNAIL: [{"id": "attX", "url": "https://dl.airtable.com/x.jpg"}]}}]
 sc, at = FakeSC([video("t1", 1), video("t2", 1)]), FakeAT([channel_row(last=NOW - timedelta(days=3))], stored)
 run(sc, at)
 up = {r["id"]: r["fields"] for r in at.patched()}
 check("thumbnail: empty field filled on update (backfill)", len(up["recT1"].get(yt.V_THUMBNAIL, [])) == 1)
 check("thumbnail: filled field never re-sent (no duplicates)", yt.V_THUMBNAIL not in up["recT2"])
+custom = "https://i.ytimg.com/vi/t4/hq720_custom_2.jpg?sqp=CPi6_dUG-oaymwEnCNAF&rs=AOn4CLBm"  # as seen live 2026-10-02
+check("thumbnail: A/B-test custom thumbnail -> the video's hq720.jpg (the custom one 404s without its query)",
+      yt.thumbnail_files(video("t4", 1, thumbnail=custom)) == [{"url": "https://i.ytimg.com/vi/t4/hq720.jpg", "filename": "t4.jpg"}])
+check("thumbnail: other file names kept as they are", [f["url"] for f in yt.thumbnail_files(video("t5", 1, thumbnail="https://i.ytimg.com/vi/t5/hqdefault.jpg?sqp=x"))]
+      == ["https://i.ytimg.com/vi/t5/hqdefault.jpg"])
 sc, at = FakeSC([video("t3", 1, thumbnail=None)]), FakeAT([channel_row()])
 run(sc, at)
 check("thumbnail: missing in the API -> no attachment, video still saved", len(at.posted()) == 1 and yt.V_THUMBNAIL not in at.posted()[0]["fields"])
@@ -188,11 +197,33 @@ check("thumbnail: missing in the API -> no attachment, video still saved", len(a
 # 4. Dates: Published = exact publishDate in UTC; the rough estimate only when it's missing
 sc, at = FakeSC([video("exact", 1), video("rough", 60, exact=False), video("nodate", 1, exact=False, publishedTime=None)]), FakeAT([channel_row()])
 run(sc, at)
-pub = {r["fields"][yt.V_VIDEO_ID]: r["fields"].get(yt.V_PUBLISHED) for r in at.posted()}
+pub = {r["fields"][yt.V_CONTENT_ID]: r["fields"].get(yt.V_PUBLISHED) for r in at.posted()}
 check("dates: all stored whatever their date", set(pub) == {"exact", "rough", "nodate"})
 check("dates: exact publishDate converted to UTC", pub["exact"] == iso(NOW - timedelta(days=1)))
 check("dates: estimate used when publishDate is missing; none -> left empty",
       pub["rough"] == iso(NOW - timedelta(days=60) + timedelta(days=20)) and pub["nodate"] is None)
+
+# 4b. Scraped Content: one table for every platform
+sc, at = FakeSC([video("c1", 1, title="My title", description="Line 1\nLine 2")]), FakeAT([channel_row()])
+run(sc, at)
+c = at.posted()[0]["fields"]
+check("content: writes go to Scraped Content and Accounts only", {t for _, t, _ in at.writes} == {yt.VIDEOS, yt.ACCOUNTS}
+      and yt.VIDEOS == "tblViAU74E50jTA5H")
+check("content: Platform YouTube, Type Video, Content ID = video ID", c[yt.V_PLATFORM] == "YouTube" and c[yt.V_TYPE] == "Video"
+      and c[yt.V_CONTENT_ID] == "c1")
+check("content: Title = video title, Text = full description", c[yt.V_TITLE] == "My title" and c[yt.V_TEXT] == "Line 1\nLine 2")
+check("content: duration, views, likes, comments, link", (c[yt.V_DURATION], c[yt.V_VIEWS], c[yt.V_LIKES], c[yt.V_COMMENTS])
+      == (1200, 1000, 50, 7) and c[yt.V_ACCOUNT] == ["recCH0000000000AA"] and c[yt.V_URL].endswith("v=c1"))
+check("content: lookups only among YouTube rows", at.platforms == {"YouTube"})
+same = [{"id": "recXX", "fields": {yt.V_CONTENT_ID: "c1", yt.V_PLATFORM: "X", yt.V_STATUS: "Reviewed"}}]
+sc, at = FakeSC([video("c1", 1)]), FakeAT([channel_row()], same)
+run(sc, at)
+check("content: an X row with the same ID is left alone; the video is created", at.patched() == [] and len(at.posted()) == 1)
+stored = [{"id": "recU", "fields": {yt.V_CONTENT_ID: "c1", yt.V_PLATFORM: "YouTube", yt.V_STATUS: "Reviewed"}}]
+sc, at = FakeSC([video("c1", 1)]), FakeAT([channel_row(last=NOW - timedelta(days=3))], stored)
+run(sc, at)
+u = at.patched()[0]["fields"]
+check("update: Platform/Type sent, Status not", u[yt.V_PLATFORM] == "YouTube" and u[yt.V_TYPE] == "Video" and yt.V_STATUS not in u)
 
 # 5. Failures: Last Scraped kept, so the channel is due again tomorrow
 sc, at = FakeSC(fail=yt.HttpError("HTTP 500 from /v1/youtube/channel-videos: oops")), FakeAT([channel_row(last=last)])

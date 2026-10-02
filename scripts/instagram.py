@@ -4,9 +4,11 @@
 For every Accounts row with Scrape = Active and Platform = Instagram:
   1. Fetch the account's first page of posts from ScrapeCreators (v2 user/posts),
      exactly one call per account: no retries, no fallback call, no paging.
-  2. Create new posts in Instagram Posts (Status = New, Thumbnail, Video) and refresh
-     existing ones (every field except Status, so "Reviewed" marks are kept).
-     Thumbnail / Video are only sent when the stored field is empty, because
+  2. Create new posts in Scraped Content (Platform = Instagram, Content ID = Shortcode,
+     Title = the caption's first line, Views = plays, Status = New, Thumbnail, Media) and
+     refresh existing ones (every field except Status, so "Reviewed" marks are kept). Only
+     the returned shortcodes are looked up in Airtable, among the Instagram rows.
+     Thumbnail / Media are only sent when the stored field is empty, because
      Instagram media URLs expire and re-sending would duplicate the files.
   3. Record Last Scraped / Last Scrape Status / Scrape Error on the account.
 
@@ -40,25 +42,31 @@ A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
 A_LAST_STATUS = "flduqhmL46oI0XJPo"
 A_SCRAPE_ERROR = "flde8rfQchM6wk7Ho"
 
-# Instagram Posts tblzyE8GISmRLPgiH
-POSTS = "tblzyE8GISmRLPgiH"
-P_SHORTCODE = "fldVOFGUBqHP67WbR"
-P_CAPTION = "fldV0HNyCIWMzqL1u"
-P_ACCOUNT = "fldTnAEv5BByNhRJ2"
-P_URL = "fldqPlIvlj7opGJV6"
-P_TYPE = "fldVeyKSNapYWaSOE"
-P_THUMBNAIL = "fldxkuJWKCsvORiLF"
-P_VIDEO = "flds2OMpQBS2Swuk2"
-P_PUBLISHED = "fldap86rxoeSJoD0W"
-P_DURATION = "fldNtlzW3ztH01ISO"
-P_PLAYS = "fldn4DMeRhMzcT1CZ"
-P_LIKES = "fldjAaHLSYRvdE2pG"
-P_COMMENTS = "fldA9fPvtScUfG7iJ"
-P_STATUS = "fldp1jdD1PCUYPYdt"
-P_LAST_SCRAPED = "fldzKIyim7PIwITBZ"
+# Scraped Content tblViAU74E50jTA5H: one table for every platform; rows match on
+# Platform + Content ID (here the Shortcode)
+POSTS = "tblViAU74E50jTA5H"
+P_CONTENT_ID = "fldQo17O1tcoje3HB"
+P_TITLE = "fldNkd3XzlbpdNPW6"
+P_PLATFORM = "fld79CFY4T9xkiA6Q"
+P_ACCOUNT = "fldn8KHcs9SurgWBE"
+P_URL = "fldQRzqXqCWMbYaLD"
+P_TYPE = "fld4g5cokEPmzaoVA"
+P_TEXT = "fldkuaPl7DjFmlj7o"
+P_PUBLISHED = "fldTdsMUfOHYCkmVP"
+P_DURATION = "fldlIejl80YEiJ4th"
+P_VIEWS = "fldoJ7VfdRHC78CeJ"  # Instagram plays
+P_LIKES = "fldBybnTMpW6Egc3O"
+P_COMMENTS = "fldPIA6Zm9Rib9Xe8"
+P_THUMBNAIL = "fldtvY62II7Sz99wS"
+P_MEDIA = "fld0CsTd3XkegpUEP"
+P_STATUS = "fld2D5rCtlEW9w2Hn"
+P_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
+PLATFORM = "Instagram"  # the Platform value of this script's rows
 
 MEDIA_TYPES = {1: "Photo", 2: "Reel", 8: "Carousel"}
 
+LOOKUP_CHUNK = 50  # Shortcodes per Airtable lookup
+TITLE_CHARS = 100  # Title = the first line of the caption, cut to this length
 BATCH = 10  # Airtable's max records per write request
 
 
@@ -209,8 +217,8 @@ def largest_image(media):
     return largest((media.get("image_versions2") or {}).get("candidates"))
 
 
-def video_files(item, code):
-    """Attachment list for the Video field: reel -> its video, carousel -> every
+def media_files(item, code):
+    """Attachment list for the Media field: reel -> its video, carousel -> every
     slide in order, photo -> the image. Empty list if nothing usable."""
     kind = MEDIA_TYPES.get(item.get("media_type"))
     files = []
@@ -233,21 +241,29 @@ def video_files(item, code):
     return files
 
 
+def first_line(text):
+    """The first non-empty line of `text`, cut to TITLE_CHARS (None if there is none)."""
+    return next((line.strip()[:TITLE_CHARS] for line in str(text or "").splitlines() if line.strip()), None)
+
+
 def post_fields(item, account_id, now, existing=None):
     """Airtable fields for one post. `existing` is None for a new post, otherwise the
     stored record's info. Status only on create; attachments only where still empty."""
     code = item.get("code")
     kind = MEDIA_TYPES.get(item.get("media_type"))
     duration = to_float(item.get("video_duration")) if kind == "Reel" else None
+    caption = (item.get("caption") or {}).get("text")
     fields = {
-        P_SHORTCODE: code,
-        P_CAPTION: (item.get("caption") or {}).get("text"),
+        P_CONTENT_ID: code,
+        P_TITLE: first_line(caption),
+        P_PLATFORM: PLATFORM,
+        P_TYPE: kind,
+        P_TEXT: caption,
         P_ACCOUNT: [account_id],
         P_URL: item.get("url"),
-        P_TYPE: kind,
         P_PUBLISHED: to_utc(item.get("created_at")) or unix_to_utc(item.get("taken_at")),
         P_DURATION: round(duration) if duration is not None else None,
-        P_PLAYS: to_int(item.get("ig_play_count")),
+        P_VIEWS: to_int(item.get("ig_play_count")),
         # Skip Likes when the owner has hidden like counts.
         P_LIKES: None if item.get("like_and_view_counts_disabled") else to_int(item.get("like_count")),
         P_COMMENTS: to_int(item.get("comment_count")),
@@ -258,17 +274,40 @@ def post_fields(item, account_id, now, existing=None):
     # Media URLs expire, so attach them once; never re-send a filled field (duplicates files).
     if (existing is None or not existing["thumbnail"]) and item.get("display_uri"):
         fields[P_THUMBNAIL] = [{"url": item["display_uri"]}]
-    if existing is None or not existing["video"]:
-        fields[P_VIDEO] = video_files(item, code) or None
+    if existing is None or not existing["media"]:
+        fields[P_MEDIA] = media_files(item, code) or None
     # Omit missing values rather than blanking out what's already stored.
     return {k: v for k, v in fields.items() if v is not None}
 
 
 def attachment_count(fields):
-    return len(fields.get(P_THUMBNAIL, [])) + len(fields.get(P_VIDEO, []))
+    return len(fields.get(P_THUMBNAIL, [])) + len(fields.get(P_MEDIA, []))
 
 
 # --- Main -----------------------------------------------------------------
+
+def lookup_existing(codes, existing):
+    """Add to `existing` (shortcode -> {"id", "thumbnail", "media"}) the given shortcodes already
+    in Scraped Content (among the Instagram rows), LOOKUP_CHUNK per filtered query, instead of
+    loading the whole table."""
+    todo = [c for c in dict.fromkeys(codes) if c not in existing]
+    for i in range(0, len(todo), LOOKUP_CHUNK):
+        chunk = todo[i:i + LOOKUP_CHUNK]
+        quoted = ",".join("{%s}='%s'" % (P_CONTENT_ID, c.replace("\\", "\\\\").replace("'", "\\'")) for c in chunk)
+        body = {"filterByFormula": f"AND({{{P_PLATFORM}}}='{PLATFORM}',OR({quoted}))",
+                "fields": [P_CONTENT_ID, P_THUMBNAIL, P_MEDIA], "returnFieldsByFieldId": True, "pageSize": 100}
+        while True:
+            page = airtable("POST", f"{POSTS}/listRecords", body=body)
+            for r in page.get("records", []):
+                code = r["fields"].get(P_CONTENT_ID)
+                if code in chunk:
+                    # Empty attachment fields are left out of Airtable's response: presence = filled.
+                    existing[code] = {"id": r["id"], "thumbnail": bool(r["fields"].get(P_THUMBNAIL)),
+                                      "media": bool(r["fields"].get(P_MEDIA))}
+            if not page.get("offset"):
+                break
+            body["offset"] = page["offset"]
+
 
 def scrape_account(account, existing, now):
     """Scrape one account; mutates `existing` (shortcode -> record info). Returns stats."""
@@ -280,10 +319,12 @@ def scrape_account(account, existing, now):
     items, charged, remaining = fetch_posts(handle)
     stats = {"created": 0, "updated": 0, "attachments": 0, "returned": len(items),
              "credits": charged, "remaining": remaining}
+    items = [i for i in items if isinstance(i, dict)]
+    lookup_existing([i["code"] for i in items if isinstance(i.get("code"), str) and i["code"]], existing)
     creates, updates, seen = [], [], set()
     for item in items:
         code = item.get("code")
-        if not code or code in seen:
+        if not isinstance(code, str) or not code or code in seen:
             continue
         seen.add(code)
         if code in existing:
@@ -301,10 +342,10 @@ def scrape_account(account, existing, now):
                 stats[key] += len(written)
                 stats["attachments"] += sum(attachment_count(r["fields"]) for r in batch)
                 for sent, rec in zip(batch, written):
-                    code = sent["fields"][P_SHORTCODE]
-                    info = existing.setdefault(code, {"id": rec["id"], "thumbnail": False, "video": False})
+                    code = sent["fields"][P_CONTENT_ID]
+                    info = existing.setdefault(code, {"id": rec["id"], "thumbnail": False, "media": False})
                     info["thumbnail"] = info["thumbnail"] or P_THUMBNAIL in sent["fields"]
-                    info["video"] = info["video"] or P_VIDEO in sent["fields"]
+                    info["media"] = info["media"] or P_MEDIA in sent["fields"]
     except Exception as e:
         e.stats = stats  # the scrape was paid for; keep its credit numbers in the summary
         raise
@@ -322,16 +363,7 @@ def main():
     ]
     log(f"{len(accounts)} active Instagram account(s)")
 
-    # Empty attachment fields are left out of Airtable's response, so presence = filled.
-    existing = {
-        r["fields"][P_SHORTCODE]: {"id": r["id"],
-                                   "thumbnail": bool(r["fields"].get(P_THUMBNAIL)),
-                                   "video": bool(r["fields"].get(P_VIDEO))}
-        for r in list_records(POSTS, [P_SHORTCODE, P_THUMBNAIL, P_VIDEO])
-        if r["fields"].get(P_SHORTCODE)
-    }
-    log(f"{len(existing)} post(s) already in Instagram Posts")
-
+    existing = {}  # shortcode -> {"id", "thumbnail", "media"}, filled by lookups of the returned codes
     results, remaining = [], None
     for account in accounts:
         name = account["fields"].get(A_NAME) or account["id"]

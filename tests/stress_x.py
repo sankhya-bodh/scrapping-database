@@ -100,9 +100,11 @@ class FakeAirtable:
                 self.full_loads += 1
             return {"records": copy.deepcopy(self.accounts if table == x.ACCOUNTS else self.rows)}
         if table == f"{x.POSTS}/listRecords":  # lookup of specific Tweet IDs
-            ids = set(re.findall(r"='(\d+)'", body["filterByFormula"]))
+            m = re.fullmatch(r"AND\(\{%s\}='X',OR\((.*)\)\)" % x.P_PLATFORM, body["filterByFormula"])
+            assert m, body["filterByFormula"]
+            ids = set(re.findall(r"\{%s\}='(\d+)'" % x.P_CONTENT_ID, m.group(1)))
             self.lookup_ids += len(ids)
-            return {"records": [copy.deepcopy(r) for r in self.rows if r["fields"].get(x.P_TWEET_ID) in ids]}
+            return {"records": [copy.deepcopy(r) for r in self.rows if r["fields"].get(x.P_CONTENT_ID) in ids]}
         if table == x.ACCOUNTS:
             for r in body["records"]:
                 next(a for a in self.accounts if a["id"] == r["id"])["fields"].update(r["fields"])
@@ -178,7 +180,7 @@ def simulate(rates, days=30, seed=1, p_first_fail=0.0, p_later_fail=0.0, p_write
             row["fields"][x.P_STATUS] = "Reviewed"
             reviewed.add(row["id"])
 
-    stored = [r["fields"][x.P_TWEET_ID] for r in at.rows]
+    stored = [r["fields"][x.P_CONTENT_ID] for r in at.rows]
     stored_set = set(stored)
     overlap = timedelta(minutes=x.OVERLAP_MINUTES)
     last_run = SIM["now"]
@@ -259,6 +261,6 @@ if __name__ == "__main__":
     show("20x10/day, twitterapi.io down 60h (big catch-up)", simulate([10] * 20, api_outage=(10, 12.5)))
     print("\n== Index lag ==")
     r = show("6x3/day, 10% of tweets indexed 20min-3h late", simulate([3] * 6, late_share=0.1))
-    print(f"\nX Posts table fully loaded: {r['full_loads']} times (only returned Tweet IDs are looked up)")
+    print(f"\nScraped Content table fully loaded: {r['full_loads']} times (only returned Tweet IDs are looked up)")
     print(f"{'All scenarios OK' if not FAILURES else 'FAILED: ' + ', '.join(FAILURES)}")
     sys.exit(1 if FAILURES else 0)

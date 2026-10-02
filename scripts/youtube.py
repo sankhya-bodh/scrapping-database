@@ -6,8 +6,9 @@ Scrape = Active and Platform = YouTube that are due (no Last Scraped yet, or Las
 RUN_DAYS days ago, less DUE_SLACK_HOURS so a slightly early daily run still counts):
   1. Fetch the channel's 30 newest regular videos (no Shorts) from ScrapeCreators
      (channel-videos, sort=latest, includeExtras=true): one call per channel, no retries.
-  2. Create every returned video not yet in YouTube Videos (Status = New): a new channel's
-     first scrape stores its 30 newest videos; later runs store whatever is new since.
+  2. Create every returned video not yet in Scraped Content (Platform = YouTube, Content ID =
+     Video ID, Type = Video, Status = New): a new channel's first scrape stores its 30 newest
+     videos; later runs store whatever is new since.
      Refresh every returned video already stored (every field except Status, so "Reviewed"
      marks are kept). Only the returned Video IDs are looked up in Airtable. The thumbnail
      is saved as an attachment (Thumbnail), only when that field is empty, so it's never
@@ -24,6 +25,7 @@ environment: AIRTABLE_ACCESS_TOKEN, SCRAPE_CREATORS. See project.md.
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -49,21 +51,25 @@ A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
 A_LAST_STATUS = "flduqhmL46oI0XJPo"
 A_SCRAPE_ERROR = "flde8rfQchM6wk7Ho"
 
-# YouTube Videos tblpMr9jQNMdm865J
-VIDEOS = "tblpMr9jQNMdm865J"
-V_TITLE = "fld0lhAm41ZN8FNY6"
-V_VIDEO_ID = "fldHbJmqwmwpzRqNy"
-V_ACCOUNT = "fldLyiD9EOEM7JHrx"
-V_URL = "fldPR4PqR4NsKru51"
-V_THUMBNAIL = "fldMcTtnax9Um4VWr"  # attachment
-V_DESCRIPTION = "fldDFQKkhZon4n068"
-V_PUBLISHED = "fldGXBPbOBna0Ww9c"
-V_DURATION = "fldPx3oe0AKQiD6iF"
-V_VIEWS = "fldcW8PfaDGj2SYWg"
-V_LIKES = "fldsvQdR1gyILQzNH"
-V_COMMENTS = "fldJ1L7ClYGut2diw"
-V_STATUS = "fld1cf4LCqxglAUGN"
-V_LAST_SCRAPED = "fldGSuB2qHERC4p5l"
+# Scraped Content tblViAU74E50jTA5H: one table for every platform; rows match on
+# Platform + Content ID (here the Video ID)
+VIDEOS = "tblViAU74E50jTA5H"
+V_CONTENT_ID = "fldQo17O1tcoje3HB"
+V_TITLE = "fldNkd3XzlbpdNPW6"
+V_PLATFORM = "fld79CFY4T9xkiA6Q"
+V_ACCOUNT = "fldn8KHcs9SurgWBE"
+V_URL = "fldQRzqXqCWMbYaLD"
+V_TYPE = "fld4g5cokEPmzaoVA"
+V_TEXT = "fldkuaPl7DjFmlj7o"
+V_PUBLISHED = "fldTdsMUfOHYCkmVP"
+V_DURATION = "fldlIejl80YEiJ4th"
+V_VIEWS = "fldoJ7VfdRHC78CeJ"
+V_LIKES = "fldBybnTMpW6Egc3O"
+V_COMMENTS = "fldPIA6Zm9Rib9Xe8"
+V_THUMBNAIL = "fldtvY62II7Sz99wS"  # attachment
+V_STATUS = "fld2D5rCtlEW9w2Hn"
+V_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
+PLATFORM = "YouTube"  # the Platform value of this script's rows
 
 RUN_DAYS = 3          # each channel is scraped every 3 days
 DUE_SLACK_HOURS = 6   # a channel is due this long before its 3 days are up (daily-run jitter)
@@ -205,11 +211,13 @@ def video_fields(video, account_id, now, is_new):
     """Airtable fields for one video. Status only on create, never on update."""
     exact = to_utc(video.get("publishDate"))
     fields = {
+        V_CONTENT_ID: video.get("id"),
         V_TITLE: video.get("title"),
-        V_VIDEO_ID: video.get("id"),
+        V_PLATFORM: PLATFORM,
+        V_TYPE: "Video",  # channel-videos returns regular videos only (Shorts are skipped)
         V_ACCOUNT: [account_id],
         V_URL: video.get("url"),
-        V_DESCRIPTION: video.get("description"),
+        V_TEXT: video.get("description"),
         # publishedTime is only day-accurate ("3 days ago"); use it for new videos when
         # publishDate is missing, but never let it overwrite an exact date on an update.
         V_PUBLISHED: exact or (to_utc(video.get("publishedTime")) if is_new else None),
@@ -235,26 +243,30 @@ def is_due(account, now_dt):
 
 def thumbnail_files(video):
     """Attachment list for the Thumbnail field (Airtable copies the image from the URL).
-    The API's link (hq720.jpg?sqp=...) serves AVIF; without the query it's a 1280x720 JPEG."""
+    The API's link (hq720.jpg?sqp=...) serves AVIF; without the query it's a 1280x720 JPEG.
+    A thumbnail being A/B tested (hq720_custom_2.jpg?sqp=...) 404s without the query, so it
+    falls back to the video's hq720.jpg (Airtable silently drops a file it can't download)."""
     url = video.get("thumbnail")
     if isinstance(url, str) and url.startswith("http"):
-        return [{"url": url.split("?")[0], "filename": f"{video['id']}.jpg"}]
+        url = re.sub(r"_custom_\d+(?=\.jpg$)", "", url.split("?")[0])
+        return [{"url": url, "filename": f"{video['id']}.jpg"}]
     return []
 
 
 def lookup_existing(ids, existing):
-    """Add to `existing` (video ID -> {"id", "thumb"}) the given IDs that are already in YouTube
-    Videos, LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
+    """Add to `existing` (video ID -> {"id", "thumb"}) the given IDs that are already in Scraped
+    Content (among the YouTube rows), LOOKUP_CHUNK per filtered query, instead of loading the
+    whole table."""
     todo = [i for i in dict.fromkeys(ids) if i not in existing]
     for i in range(0, len(todo), LOOKUP_CHUNK):
         chunk = todo[i:i + LOOKUP_CHUNK]
-        quoted = ",".join("{%s}='%s'" % (V_VIDEO_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
-        body = {"filterByFormula": f"OR({quoted})", "fields": [V_VIDEO_ID, V_THUMBNAIL],
+        quoted = ",".join("{%s}='%s'" % (V_CONTENT_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
+        body = {"filterByFormula": f"AND({{{V_PLATFORM}}}='{PLATFORM}',OR({quoted}))", "fields": [V_CONTENT_ID, V_THUMBNAIL],
                 "returnFieldsByFieldId": True, "pageSize": 100}
         while True:
             page = airtable("POST", f"{VIDEOS}/listRecords", body=body)
             for r in page.get("records", []):
-                vid = r["fields"].get(V_VIDEO_ID)
+                vid = r["fields"].get(V_CONTENT_ID)
                 if vid in chunk:
                     # Empty attachment fields are left out of Airtable's response: presence = filled.
                     existing[vid] = {"id": r["id"], "thumb": bool(r["fields"].get(V_THUMBNAIL))}
@@ -300,7 +312,7 @@ def scrape_account(account, existing, now):
             written = write_batches(method, VIDEOS, records)
             stats[key] = len(written)
             for sent, rec in zip(records, written):
-                vid = sent["fields"][V_VIDEO_ID]
+                vid = sent["fields"][V_CONTENT_ID]
                 info = existing.setdefault(vid, {"id": rec["id"], "thumb": False})
                 info["thumb"] = info["thumb"] or V_THUMBNAIL in sent["fields"]
                 stats["thumbnails"] += V_THUMBNAIL in sent["fields"]

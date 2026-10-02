@@ -7,8 +7,9 @@ Runs daily. For every Accounts row with Scrape = Active and Platform = Reddit:
      Timeframe "day" (the last 24 hours, about 25 posts) on the daily run. "week" for a new
      subreddit's first scrape (no Last Scraped yet), and to catch up when the last
      successful scrape is more than CATCHUP_HOURS old (missed days).
-  2. Create new posts in Reddit Posts (Status = New, Media) and refresh existing
-     ones (every field except Status, so "Reviewed" marks are kept).
+  2. Create new posts in Scraped Content (Platform = Reddit, Content ID = Post ID, Type from
+     post_hint, Status = New, Media) and refresh existing ones (every field except Status,
+     so "Reviewed" marks are kept).
      Media is only sent when the stored field is empty, so files are never duplicated.
      Reddit videos need a free DASHPlaylist.mpd fetch from v.redd.it; if that fails
      the post is saved without Media and the next run tries again.
@@ -52,22 +53,26 @@ A_LAST_SCRAPED = "fldn87Q7Uz8fl7erL"
 A_LAST_STATUS = "flduqhmL46oI0XJPo"
 A_SCRAPE_ERROR = "flde8rfQchM6wk7Ho"
 
-# Reddit Posts tblGeKN96WduU1LST
-POSTS = "tblGeKN96WduU1LST"
-P_TITLE = "fldNP4fmDla9qXRJN"
-P_POST_ID = "fldFA9UHqN8OZCCEX"
-P_ACCOUNT = "fldQPEPJd9P1BwwTC"
-P_URL = "fldpHZh1dyuZOWhAV"
-P_AUTHOR = "fldokpQfytz0xdvvH"
-P_BODY = "fld6sJSqSR6RsA6TB"
-P_FLAIR = "fldjC74rWqnWwOHJi"
-P_PUBLISHED = "fldjCepCEwDTb6gCC"
-P_SCORE = "fldwZ699jquLi9sCH"
-P_UPVOTE_RATIO = "fldw8xKMJtiZWM8xK"
-P_COMMENTS = "fldbAoITrwj2unEM5"
-P_STATUS = "fld8DyHomv6kif3Mp"
-P_LAST_SCRAPED = "fldqWd5fN3bSOwhY5"
-P_MEDIA = "fld9xymRDoAepsUwn"
+# Scraped Content tblViAU74E50jTA5H: one table for every platform; rows match on
+# Platform + Content ID (here the Post ID)
+POSTS = "tblViAU74E50jTA5H"
+P_CONTENT_ID = "fldQo17O1tcoje3HB"
+P_TITLE = "fldNkd3XzlbpdNPW6"
+P_PLATFORM = "fld79CFY4T9xkiA6Q"
+P_ACCOUNT = "fldn8KHcs9SurgWBE"
+P_URL = "fldQRzqXqCWMbYaLD"
+P_TYPE = "fld4g5cokEPmzaoVA"
+P_TEXT = "fldkuaPl7DjFmlj7o"
+P_AUTHOR = "fldTvHNMgNc2DjXEk"
+P_FLAIR = "fldQISDIW9m5QF5QA"
+P_PUBLISHED = "fldTdsMUfOHYCkmVP"
+P_COMMENTS = "fldPIA6Zm9Rib9Xe8"
+P_SCORE = "fldAlSelO3OXm353v"
+P_UPVOTE_RATIO = "fldXWnVTWEqgepC02"
+P_MEDIA = "fld0CsTd3XkegpUEP"
+P_STATUS = "fld2D5rCtlEW9w2Hn"
+P_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
+PLATFORM = "Reddit"  # the Platform value of this script's rows
 
 # v.redd.it serves CMAF files to browser-like clients; a bare urllib UA may be refused.
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -276,16 +281,35 @@ def media_files(post):
     return []
 
 
+def post_type(post):
+    """Type from ScrapeCreators' post_hint (text, image, video, gallery, multi_media, link, ...)
+    and the link: Gallery, Photo, Video, Text (self posts, also with inline media), else Link."""
+    hint = post.get("post_hint")
+    url = str(post.get("url") or "")
+    if hint == "gallery" or "reddit.com/gallery/" in url:
+        return "Gallery"
+    if hint == "image" or "i.redd.it" in url:
+        return "Photo"
+    if hint in ("video", "hosted:video") or "v.redd.it" in url or post.get("is_video") is True:
+        return "Video"
+    if hint in ("text", "self", "multi_media") or post.get("is_self") is True \
+            or str(post.get("domain") or "").startswith("self."):
+        return "Text"
+    return "Link"
+
+
 def post_fields(post, account_id, now, existing=None):
     """Airtable fields for one post (Media is added separately). `existing` is None for a
     new post, otherwise the stored record's info. Status only on create, never on update."""
     fields = {
+        P_CONTENT_ID: post.get("id"),
         P_TITLE: post.get("title"),
-        P_POST_ID: post.get("id"),
+        P_PLATFORM: PLATFORM,
+        P_TYPE: post_type(post),
         P_ACCOUNT: [account_id],
         P_URL: thread_url(post),
         P_AUTHOR: post.get("author"),
-        P_BODY: post.get("selftext"),
+        P_TEXT: post.get("selftext"),
         P_FLAIR: post.get("link_flair_text"),
         P_PUBLISHED: to_utc(post.get("created_at_iso")) or unix_to_utc(post.get("created_utc")),
         P_SCORE: to_int(post.get("score")),
@@ -315,18 +339,18 @@ def timeframe_for(account, now_dt):
 
 
 def lookup_existing(ids, existing):
-    """Add to `existing` (post ID -> {"id", "media"}) the given IDs already in Reddit Posts,
-    LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
+    """Add to `existing` (post ID -> {"id", "media"}) the given IDs already in Scraped Content
+    (among the Reddit rows), LOOKUP_CHUNK per filtered query, instead of loading the whole table."""
     todo = [i for i in dict.fromkeys(ids) if i not in existing]
     for i in range(0, len(todo), LOOKUP_CHUNK):
         chunk = todo[i:i + LOOKUP_CHUNK]
-        quoted = ",".join("{%s}='%s'" % (P_POST_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
-        body = {"filterByFormula": f"OR({quoted})", "fields": [P_POST_ID, P_MEDIA],
+        quoted = ",".join("{%s}='%s'" % (P_CONTENT_ID, v.replace("\\", "\\\\").replace("'", "\\'")) for v in chunk)
+        body = {"filterByFormula": f"AND({{{P_PLATFORM}}}='{PLATFORM}',OR({quoted}))", "fields": [P_CONTENT_ID, P_MEDIA],
                 "returnFieldsByFieldId": True, "pageSize": 100}
         while True:
             page = airtable("POST", f"{POSTS}/listRecords", body=body)
             for r in page.get("records", []):
-                pid = r["fields"].get(P_POST_ID)
+                pid = r["fields"].get(P_CONTENT_ID)
                 if pid in chunk:
                     # Empty attachment fields are left out of Airtable's response: presence = filled.
                     existing[pid] = {"id": r["id"], "media": bool(r["fields"].get(P_MEDIA))}
@@ -386,7 +410,7 @@ def scrape_account(account, existing, now):
                 stats[key] += len(written)
                 stats["media_added"] += sum(len(r["fields"].get(P_MEDIA, [])) for r in batch)
                 for sent, rec in zip(batch, written):
-                    pid = sent["fields"][P_POST_ID]
+                    pid = sent["fields"][P_CONTENT_ID]
                     info = existing.setdefault(pid, {"id": rec["id"], "media": False})
                     info["media"] = info["media"] or P_MEDIA in sent["fields"]
     except Exception as e:

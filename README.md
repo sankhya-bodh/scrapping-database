@@ -1,6 +1,6 @@
 # Content OS Database scrapers
 
-Python scripts that fill an Airtable base with posts from creators and communities on X, YouTube, Instagram and Reddit. Each script creates new posts (marked `New` for review) and updates the metrics on posts it has already stored.
+Python scripts that fill an Airtable base with posts from creators and communities on X, YouTube, Instagram and Reddit. Every platform's posts go into one table, **Scraped Content**. Each script creates new posts (marked `New` for review) and updates the metrics on posts it has already stored.
 
 - **Python 3.9+, standard library only.** Nothing to install.
 - **X** uses [twitterapi.io](https://twitterapi.io). YouTube, Instagram and Reddit use the [ScrapeCreators API](https://docs.scrapecreators.com/).
@@ -8,13 +8,33 @@ Python scripts that fill an Airtable base with posts from creators and communiti
 
 | Script | Reads | Writes to | Schedule |
 |---|---|---|---|
-| `scripts/x.py` | Accounts with Platform = X, Scrape = Active | X Posts | every 6 hours, and when an X account is added |
+| `scripts/x.py` | Accounts with Platform = X, Scrape = Active | Scraped Content | every 6 hours, and when an X account is added |
 | `scripts/x_profile.py` | One new Accounts row (its Profile URL) | that row's X profile details | when an X account is added |
-| `scripts/youtube.py` | Accounts with Platform = YouTube, Scrape = Active | YouTube Videos | each channel every 3 days (checked daily), and when a channel is added |
+| `scripts/youtube.py` | Accounts with Platform = YouTube, Scrape = Active | Scraped Content | each channel every 3 days (checked daily), and when a channel is added |
 | `scripts/youtube_profile.py` | One new Accounts row (its Profile URL) | that row's YouTube channel details | when a channel is added |
-| `scripts/instagram.py` | Instagram accounts | Instagram Posts | every 3 days |
-| `scripts/reddit.py` | Accounts with Platform = Reddit, Scrape = Active | Reddit Posts | daily, and when a subreddit is added |
+| `scripts/instagram.py` | Accounts with Platform = Instagram, Scrape = Active | Scraped Content | not scheduled |
+| `scripts/reddit.py` | Accounts with Platform = Reddit, Scrape = Active | Scraped Content | daily, and when a subreddit is added |
 | `scripts/reddit_profile.py` | One new Accounts row (its Profile URL) | that row's subreddit details | when a subreddit is added |
+
+## The Scraped Content table
+
+One row per post, video or tweet, from every platform. A row is identified by **Platform + Content ID** (the Tweet ID, YouTube video ID, Reddit post ID or Instagram shortcode), so the same ID on two platforms is two separate rows, and each scraper only ever looks up and updates its own platform's rows. Fields a platform doesn't have stay empty.
+
+| Field | X | YouTube | Reddit | Instagram |
+|---|---|---|---|---|
+| Content ID, Platform, Account, URL, Published, Comments, Status, Last Scraped | ✓ | ✓ | ✓ | ✓ |
+| Title | the tweet's first line (100 characters) | title | title | the caption's first line (100 characters) |
+| Type | Text / Photo / Video | Video | Text / Photo / Video / Link / Gallery | Reel / Photo / Carousel |
+| Text | tweet | description | body | caption |
+| Views | views | views | | plays |
+| Likes | ✓ | ✓ | | ✓ |
+| Duration | | ✓ | | ✓ (reels) |
+| Reposts, Quotes, Bookmarks | ✓ | | | |
+| Author, Flair, Score, Upvote Ratio | | | ✓ | |
+| Thumbnail | | ✓ | | ✓ |
+| Media | photos, videos | | image, or video + audio | the reel, slides or photo |
+
+Status is set to `New` only when a row is created, so `Reviewed` is never reset. Attachments are sent only while the field is empty, so files are never duplicated.
 
 ## Setup
 
@@ -69,13 +89,15 @@ It prints a summary per account and the estimated credits used. It exits with co
 
 ## Tests
 
-The tests are offline: twitterapi.io and Airtable are replaced with fakes, so they use no credits and need no keys.
+The tests are offline: twitterapi.io, ScrapeCreators and Airtable are replaced with fakes, so they use no credits and need no keys.
 
 ```bash
 python3 tests/test_x.py     # unit tests
 python3 tests/test_x_profile.py  # new X account setup
 python3 tests/test_youtube.py    # YouTube scraper and new channel setup
 python3 tests/test_reddit.py     # Reddit scraper and new subreddit setup
+python3 tests/test_instagram.py  # Instagram scraper
+python3 tests/test_scraped_content.py  # all four scrapers sharing one table, every write checked against its schema
 python3 tests/fuzz_x.py     # malformed API data
 python3 tests/stress_x.py   # 30-day simulations: missed tweets, duplicates, credit use
 ```
