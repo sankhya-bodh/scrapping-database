@@ -25,7 +25,7 @@ class FixedDT(datetime):
 
 x.datetime = FixedDT
 iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-H6 = timedelta(hours=6)
+D = timedelta(hours=24)  # one day: the schedule interval
 M15 = timedelta(minutes=15)
 
 
@@ -38,7 +38,7 @@ def acc(rec, handle, pid, last=None, status="never", scrape="Active", platform="
 
 
 EP = acc("recEP", "example_user", EP_ID)
-prev = NOW - H6
+prev = NOW - D  # the previous daily run
 EP_OK = acc("recEP", "example_user", EP_ID, iso(prev), "ok")  # read up to the previous run
 passed = failed = 0
 
@@ -168,8 +168,8 @@ check("query shape", tw.params[0]["query"].startswith("(from:example_user) since
       and tw.params[0]["query"].endswith("-filter:replies -filter:retweets") and tw.params[0]["queryType"] == "Latest")
 check("cursor only from page 2", "cursor" not in tw.params[0] and tw.params[1]["cursor"] == SAMPLE["next_cursor"])
 check("until = moment of execution", until == int(NOW.timestamp()))
-check("new account: last 24 hours exactly, in 3 slices", until - since == 24 * 3600
-      and len({q_times(p) for p in tw.params}) == 3)
+check("new account: last 24 hours exactly, in one query", until - since == 24 * 3600
+      and len({q_times(p) for p in tw.params}) == 1)
 posts = at.posted()
 check("#8 quote tweets skipped, 2 originals created", len(posts) == 2 and "2 quote/reply/retweet skipped" in out
       and not {q["id"] for q in quotes} & {r["fields"][x.P_CONTENT_ID] for r in posts})
@@ -181,7 +181,7 @@ check("linked, Status New, html unescaped", c[x.P_ACCOUNT] == ["recEP"] and c[x.
 u = at.account_updates()["recEP"]
 check("success: Last Scraped = run time, ok", u[x.A_LAST_SCRAPED] == iso(NOW) and u[x.A_LAST_STATUS] == "ok")
 check("#7 success clears Scrape Error (sends null)", x.A_SCRAPE_ERROR in u and u[x.A_SCRAPE_ERROR] is None)
-check("est credits 105 (4 tweets + 3 empty pages)", "est. credits 105" in out)
+check("est credits 75 (4 tweets + 1 empty page)", "est. credits 75" in out)
 
 # 2. #4 Only the returned Tweet IDs are looked up; the table is never loaded
 check("#4 Scraped Content table not loaded", at.full_loads == 0)
@@ -202,44 +202,51 @@ check("#4 quote in lookup formula escaped", "\\'" in "{%s}='%s'" % (x.P_CONTENT_
 # 3. Window rules
 def ws(accounts):
     return x.window_start(accounts, NOW)
-H8, H24 = timedelta(hours=8), timedelta(hours=24)
-check("window: on schedule, last 8 hours", ws([acc("a", "a", "1", iso(prev), "ok")]) == int((NOW - H8).timestamp()))
-check("window: run 7h45m after the last, still 8 hours", ws([acc("a", "a", "1", iso(NOW - timedelta(hours=7, minutes=45)), "ok")]) == int((NOW - H8).timestamp()))
-check("window: after a failure, gap re-read", ws([acc("a", "a", "1", iso(NOW - 2 * H6), "error")]) == int((NOW - 2 * H6 - M15).timestamp()))
+H24 = timedelta(hours=24)
+check("window: on schedule, the last 24 hours + the overlap", ws([acc("a", "a", "1", iso(prev), "ok")]) == int((NOW - D - M15).timestamp()))
+check("window: run 20h after the last (GitHub was late before), still 24 hours",
+      ws([acc("a", "a", "1", iso(NOW - timedelta(hours=20)), "ok")]) == int((NOW - H24).timestamp()))
+check("window: run 29h after the last (GitHub late today), the full gap", ws([acc("a", "a", "1", iso(NOW - timedelta(hours=29)), "ok")])
+      == int((NOW - timedelta(hours=29) - M15).timestamp()))
+check("window: after a failed day, gap re-read", ws([acc("a", "a", "1", iso(NOW - 2 * D), "error")]) == int((NOW - 2 * D - M15).timestamp()))
+check("window: after 5 failed days, 5h late (149h), still caught up", ws([acc("a", "a", "1", iso(NOW - timedelta(hours=149)), "error")])
+      == int((NOW - timedelta(hours=149) - M15).timestamp()))
+check("window: over 7 days behind = new, last 24 hours", ws([acc("a", "a", "1", iso(NOW - timedelta(hours=169)), "error")])
+      == int((NOW - H24).timestamp()))
 check("window: new accounts, last 24 hours", ws([acc("b", "b", "2"), acc("c", "c", "3")]) == int((NOW - H24).timestamp()))
-check("window: stale (>72h) = new, last 24 hours", ws([acc("b", "b", "2", iso(NOW - timedelta(days=10)), "ok")]) == int((NOW - H24).timestamp()))
-check("window: future Last Scraped = new", ws([acc("a", "a", "1", iso(NOW + H6), "ok")]) == int((NOW - H24).timestamp()))
+check("window: stale (10 days) = new, last 24 hours", ws([acc("b", "b", "2", iso(NOW - timedelta(days=10)), "ok")]) == int((NOW - H24).timestamp()))
+check("window: future Last Scraped = new", ws([acc("a", "a", "1", iso(NOW + D), "ok")]) == int((NOW - H24).timestamp()))
 
 # 4. #2 Grouping: one account behind doesn't rewind the others
 g = x.group_accounts([acc(f"r{i}", f"u{i}", str(i), iso(prev), "ok") for i in range(5)]
-                     + [acc("rLate", "late", "99", iso(NOW - 4 * H6), "error")], NOW)
+                     + [acc("rLate", "late", "99", iso(NOW - 2 * D), "error")], NOW)
 check("#2 account behind gets its own query", len(g) == 2 and [a["id"] for a in g[1]] == ["rLate"] and len(g[0]) == 5)
 g = x.group_accounts([acc(f"r{i}", f"u{i}", str(i), iso(prev + timedelta(minutes=i)), "ok") for i in range(20)], NOW)
 check("#2 20 up-to-date accounts -> 15 + 5", [len(b) for b in g] == [15, 5])
 g = x.group_accounts([acc("r0", "u0", "0", iso(prev), "ok"), acc("rNew", "new", "5")], NOW)
-check("#2 new account gets its own batch (its 24h, not 8h)", len(g) == 2 and [a["id"] for a in g[1]] == ["rNew"])
+check("#2 new account gets its own batch (its 24h, no overlap)", len(g) == 2 and [a["id"] for a in g[1]] == ["rNew"])
 g = x.group_accounts([acc(f"rN{i}", f"n{i}", str(i)) for i in range(20)], NOW)
 check("#2 20 new accounts -> 15 + 5", [len(b) for b in g] == [15, 5])
-g = x.group_accounts([acc("rLate", "late", "99", iso(NOW - 4 * H6), "error"), acc("rNew", "new", "5")], NOW)
+g = x.group_accounts([acc("rLate", "late", "99", iso(NOW - 2 * D), "error"), acc("rNew", "new", "5")], NOW)
 check("#2 new account never joins a catching-up batch (no backfill)", len(g) == 2 and [a["id"] for a in g[1]] == ["rNew"])
-accs = [acc(f"r{i}", f"u{i}", str(1000 + i), iso(prev), "ok") for i in range(3)] + [acc("rLate", "late", "999", iso(NOW - 4 * H6), "error")]
+accs = [acc(f"r{i}", f"u{i}", str(1000 + i), iso(prev), "ok") for i in range(3)] + [acc("rLate", "late", "999", iso(NOW - 2 * D), "error")]
 tw, at = WorldTW([]), FakeAT(accs)
 run(tw, at)
 qs = [(p["query"].count("from:"), until - since) for p in tw.params for since, until in [q_times(p)]]
-check("#2 end to end: up-to-date batch reads 8h, the late one reads its own 24h",
-      qs[0] == (3, 8 * 3600) and all(n == 1 for n, _ in qs[1:]) and sum(d for _, d in qs[1:]) == 24 * 3600 + 15 * 60)
+check("#2 end to end: up-to-date batch reads 24h + overlap, the late one its own 48h + overlap",
+      qs[0] == (3, 24 * 3600 + 15 * 60) and all(n == 1 for n, _ in qs[1:]) and sum(d for _, d in qs[1:]) == 48 * 3600 + 15 * 60)
 
 # 5. #1 Slices and the page cap: nothing unread is ever skipped, nothing paid twice
-check("slices: 8h is one slice", x.slices(0, 8 * 3600) == [(0, 8 * 3600)])
-check("slices: 30h -> 8+8+8+6", [b - a for a, b in x.slices(0, 30 * 3600)] == [8 * 3600] * 3 + [6 * 3600])
-late = acc("recEP", "example_user", EP_ID, iso(NOW - 5 * H6), "error")  # 30h behind
+check("slices: a day's window, even 5h late (29h15m), is one query", x.slices(0, 29 * 3600 + 900) == [(0, 29 * 3600 + 900)])
+check("slices: 100h -> 30+30+30+10", [b - a for a, b in x.slices(0, 100 * 3600)] == [30 * 3600] * 3 + [10 * 3600])
+late = acc("recEP", "example_user", EP_ID, iso(NOW - 2.5 * D), "error")  # 60h behind
 busy = [tweet(str(80000 + i), EP_ID, "example_user", NOW - timedelta(minutes=5 * i + 1)) for i in range(350)]  # 350 in ~29h
 tw, at = WorldTW(busy), FakeAT([late])
 code, out = run(tw, at)
 got = {r["fields"][x.P_CONTENT_ID] for r in at.posted()}
 u = at.account_updates()["recEP"]
-check("#1 350 tweets in a 30h catch-up: all saved", len(got) == 350 and len(at.posted()) == 350)
-check("#1 slices read oldest first", q_times(tw.params[0])[0] == int((NOW - 5 * H6 - M15).timestamp()))
+check("#1 350 tweets in a 60h catch-up: all saved", len(got) == 350 and len(at.posted()) == 350)
+check("#1 slices read oldest first", q_times(tw.params[0])[0] == int((NOW - 2.5 * D - M15).timestamp()))
 check("#1 no tweet billed twice (boundary seconds aside)", tw.billed <= 350 + 2 * tw.calls)
 check("#1 ok, Last Scraped = now", u[x.A_LAST_STATUS] == "ok" and u[x.A_LAST_SCRAPED] == iso(NOW))
 flood = [tweet(str(90000 + i), EP_ID, "example_user", NOW - timedelta(minutes=5)) for i in range(250)]  # all in one second
@@ -435,7 +442,54 @@ u = at.patched()[0]["fields"]
 check("update: Platform, Title, Type sent; Status not", u[x.P_PLATFORM] == "X" and x.P_TITLE in u and x.P_TYPE in u
       and x.P_STATUS not in u)
 
-# 11. #6 Single-flight lock
+# 11. An Airtable write that fails is retried once (one run a day: a failed write costs a day)
+class FlakyAT(FakeAT):
+    """FakeAT whose content-table writes fail as scripted: {write number: (error, saved anyway)}."""
+    def __init__(self, *a, flaky=None, **k):
+        super().__init__(*a, **k)
+        self.flaky, self.content_writes = flaky or {}, 0
+
+    def __call__(self, method, table, params=None, body=None):
+        if table == x.POSTS and method in ("POST", "PATCH"):
+            self.content_writes += 1
+            if self.content_writes in self.flaky:
+                err, saved = self.flaky[self.content_writes]
+                if saved:
+                    super().__call__(method, table, params, body)
+                raise err
+        return super().__call__(method, table, params, body)
+
+
+SLEEPS.clear()
+tw, at = FakeTW([SAMPLE, EMPTY]), FlakyAT([EP_OK], flaky={1: (x.HttpError("HTTP 503 from /v0: busy", 503), False)})
+code, out = run(tw, at)
+u = at.account_updates()["recEP"]
+check("airtable retry: 503 once -> retried, saved, ok, Last Scraped moves", code == 0 and len(at.posts) == 2
+      and u[x.A_LAST_STATUS] == "ok" and u[x.A_LAST_SCRAPED] == iso(NOW) and SLEEPS == [x.RETRY_WAIT_SECONDS])
+SLEEPS.clear()
+tw, at = FakeTW([SAMPLE, EMPTY]), FlakyAT([EP_OK], flaky={1: (x.HttpError("Network error for /v0: reset"), True)})
+code, out = run(tw, at)
+ids = [p["fields"][x.P_CONTENT_ID] for p in at.posts]
+check("airtable retry: create saved despite the error -> found again, not created twice", code == 0
+      and sorted(ids) == sorted(set(ids)) and len(ids) == 2 and "created 2" in out and SLEEPS == [x.RETRY_WAIT_SECONDS])
+stored = [{"id": "recOLD", "fields": {x.P_CONTENT_ID: "2000000000000000002", x.P_PLATFORM: "X"}}]
+tw, at = FakeTW([SAMPLE, EMPTY]), FlakyAT([EP_OK], stored, flaky={1: (x.HttpError("HTTP 502 from /v0: bad gateway", 502), False),  # the update
+                                                                  3: (x.HttpError("HTTP 502 from /v0: bad gateway", 502), True)})  # the create
+code, out = run(tw, at)
+ids = [p["fields"][x.P_CONTENT_ID] for p in at.posts]
+check("airtable retry: update and create each retried once, no duplicates", code == 0 and sorted(ids) == sorted(set(ids))
+      and len(ids) == 2 and "created 1, updated 1" in out)
+SLEEPS.clear()
+tw, at = FakeTW([SAMPLE, EMPTY]), FlakyAT([EP_OK], flaky={1: (x.HttpError("HTTP 403 from /v0: forbidden", 403), False)})
+code, out = run(tw, at)
+check("airtable retry: 403 not retried -> error, Last Scraped kept", code == 1 and SLEEPS == []
+      and x.A_LAST_SCRAPED not in at.account_updates()["recEP"])
+tw, at = FakeTW([SAMPLE, EMPTY]), FlakyAT([EP_OK], flaky={1: (x.HttpError("HTTP 503", 503), False), 2: (x.HttpError("HTTP 503", 503), False)})
+code, out = run(tw, at)
+check("airtable retry: fails twice -> error, Last Scraped kept", code == 1 and at.posts == []
+      and x.A_LAST_SCRAPED not in at.account_updates()["recEP"])
+
+# 12. #6 Single-flight lock
 x.LOCK_FILE = x.Path(os.environ.get("TMPDIR", "/tmp")) / "x_scrape_test.lock"
 first = x.acquire_lock()
 second = x.acquire_lock()

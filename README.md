@@ -8,7 +8,7 @@ Python scripts that fill an Airtable base with posts from creators and communiti
 
 | Script | Reads | Writes to | Schedule |
 |---|---|---|---|
-| `scripts/x.py` | Accounts with Platform = X, Scrape = Active | Scraped Content | every 6 hours, and when an X account is added |
+| `scripts/x.py` | Accounts with Platform = X, Scrape = Active | Scraped Content | daily at 07:00 IST, and when an X account is added |
 | `scripts/x_profile.py` | One new Accounts row (its Profile URL) | that row's X profile details | when an X account is added |
 | `scripts/youtube.py` | Accounts with Platform = YouTube, Scrape = Active | Scraped Content | each channel every 3 days (checked daily), and when a channel is added |
 | `scripts/youtube_profile.py` | One new Accounts row (its Profile URL) | that row's YouTube channel details | when a channel is added |
@@ -59,13 +59,13 @@ It prints a summary per account and the estimated credits used. It exits with co
 
 ## How the X scraper works
 
-- **Every 6 hours, the last 8 hours.** Each scheduled run reads the tweets posted in the 8 hours before it starts. The 2 hours of overlap cover runs GitHub starts late and tweets X's search shows late.
-- **New accounts: the last 24 hours, once.** An account with no Last Scraped (or one paused for more than 72 hours) is read from 24 hours back, no further, in its own query. That happens straight away when the Airtable automation starts the [new-account run](#new-x-accounts), or else at the next scheduled run.
-- **After a failure:** the next run re-reads the missed time, from where the last successful run ended (the account's Last Scraped) minus 15 minutes, up to 72 hours back. If a new account's first read fails, its Last Scraped is set to the start of its 24 hours, so the next run still reads all of them.
+- **Daily at 07:00 IST, the last 24 hours.** Each scheduled run reads the tweets posted since the previous run ended (at least the last 24 hours), plus 15 minutes of overlap for tweets X's search shows late. A run GitHub starts late reads the longer gap, so nothing falls between two runs.
+- **New accounts: the last 24 hours, once.** An account with no Last Scraped (or one paused for more than 7 days) is read from 24 hours back, no further, in its own query. That happens straight away when the Airtable automation starts the [new-account run](#new-x-accounts), or else at the next scheduled run.
+- **After a failure:** the next run re-reads the missed time, from where the last successful run ended (the account's Last Scraped) minus 15 minutes, up to 7 days back, so up to 5 missed days in a row lose nothing. A failed Airtable write is retried once before the batch gives up for the day. If a new account's first read fails, its Last Scraped is set to the start of its 24 hours, so the next run still reads all of them.
 - **Batched:** up to 15 accounts per query, `(from:a OR from:b …) since_time:… until_time:… -filter:replies -filter:retweets`, following [twitterapi.io's monitoring guide](https://twitterapi.io/blog/how-to-monitor-twitter-accounts-for-new-tweets-in-real-time).
 - **What it keeps:** original tweets only. Replies and retweets are filtered out in the query; quote tweets are dropped after.
-- **Metrics:** likes, views and other counts are captured when a tweet is 0–6 hours old, and updated once more if it's 6–8 hours old at the next run. A tweet seen again is updated, never duplicated, and its Status (e.g. Reviewed) is kept.
-- **Cost:** twitterapi.io charges about 15 credits per tweet (1M credits = $10). Example: 20 accounts posting 3 times a day ≈ 41k credits (about $0.41) a month. The 2-hour overlap costs about 25% more than reading only 6 hours. A new account's first 24 hours cost its tweets from that day, once.
+- **Metrics:** likes, views and other counts are captured once, when a tweet is 0–24 hours old. A tweet seen again (in the overlap) is updated, never duplicated, and its Status (e.g. Reviewed) is kept.
+- **Cost:** twitterapi.io charges about 15 credits per tweet, and at least 15 per call (1M credits = $10). A normal day is one query per batch of up to 15 accounts, usually 2 calls. Example: 20 accounts posting 3 times a day ≈ 31k credits (about $0.31) a month. A new account's first 24 hours cost its tweets from that day, once.
 
 ## How the YouTube scraper works
 
@@ -105,14 +105,14 @@ They also run on GitHub on every push (`.github/workflows/tests.yml`).
 
 ## Deployment (GitHub Actions)
 
-- `.github/workflows/x-scrape.yml` runs `scripts/x.py` every 6 hours at 00:17, 06:17, 12:17 and 18:17 UTC.
+- `.github/workflows/x-scrape.yml` runs `scripts/x.py` daily at 01:30 UTC (07:00 IST).
 - `.github/workflows/youtube-scrape.yml` runs `scripts/youtube.py` daily at 03:37 UTC; each channel is scraped every 3 days.
 - `.github/workflows/reddit-scrape.yml` runs `scripts/reddit.py` daily at 04:07 UTC.
 
 You can also start either by hand: Actions → the workflow → Run workflow. Only one run per platform happens at a time (scheduled or new-account): a run started while another is going waits for it to finish.
 
 1. **Repository secrets** (Settings → Secrets and variables → Actions): `AIRTABLE_ACCESS_TOKEN`, `TWITTER_API` (X) and `SCRAPE_CREATORS` (X profiles, YouTube and the other scrapers).
-2. **Timing:** GitHub can start scheduled runs late, or occasionally skip one, when it's busy. Nothing is lost: an X run reads from where the last successful run ended (up to 72 hours back), a YouTube channel stays due until it's scraped, and a subreddit that missed a day reads the top of the week.
+2. **Timing:** GitHub can start scheduled runs late (the X runs have started up to 5 hours late), or occasionally skip one, when it's busy. Nothing is lost: an X run reads from where the last successful run ended (up to 7 days back), a YouTube channel stays due until it's scraped, and a subreddit that missed a day reads the top of the week.
 3. **60-day rule:** GitHub turns off scheduled workflows in a public repository after 60 days with no activity (commits, issues, pull requests). It emails a warning first. To turn it back on, make any commit, or open Actions → the workflow → Enable workflow.
 4. **Alerts:** a run that fails (exit code 1) shows red in the Actions tab, and GitHub emails the repository owner. The failing accounts are also marked `error` in Airtable, with the reason in Scrape Error.
 

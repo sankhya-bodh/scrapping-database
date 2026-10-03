@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """X (Twitter) scraper for the Content OS Database Airtable base.
 
-Runs every 6 hours. For the Accounts rows with Scrape = Active and Platform = X:
+Runs once a day (07:00 IST). For the Accounts rows with Scrape = Active and Platform = X:
   1. Fetch the original tweets posted since the previous run from twitterapi.io
      (tweet/advanced_search), following the twitterapi.io "monitor accounts for new
      tweets" guide, with up to HANDLES_PER_QUERY accounts batched into one query:
@@ -9,7 +9,7 @@ Runs every 6 hours. For the Accounts rows with Scrape = Active and Platform = X:
      until_time = the moment the run starts. since_time = WINDOW_HOURS back, or earlier if
      the batch's last fully read window (its accounts' Last Scraped) ended before that, minus
      OVERLAP_MINUTES for tweets the search indexes late. So a run normally reads the last
-     8 hours, and after a failed run the next one re-reads the gap (at most MAX_CATCHUP_HOURS).
+     24 hours, and after a failed run the next one re-reads the gap (at most MAX_CATCHUP_HOURS).
      Accounts are batched with others whose Last Scraped is about the same, so one behind
      doesn't rewind the rest. A newly added account (no Last Scraped, or a resumed one whose
      Last Scraped is older than MAX_CATCHUP_HOURS) is read in its own batch from
@@ -90,14 +90,14 @@ P_STATUS = "fld2D5rCtlEW9w2Hn"
 P_LAST_SCRAPED = "fldtqUWCeQmuP2Ofs"
 PLATFORM = "X"  # the Platform value of this script's rows
 
-RUN_HOURS = 6             # schedule interval
-WINDOW_HOURS = 8          # each scheduled run reads at least the last 8 hours
+RUN_HOURS = 24            # schedule interval: once a day, 07:00 IST
+WINDOW_HOURS = 24         # each scheduled run reads at least the last 24 hours
 NEW_ACCOUNT_HOURS = 24    # a new account's first read goes back this far, no further
 OVERLAP_MINUTES = 15      # a catch-up window starts this much before the last one ended
-MAX_CATCHUP_HOURS = 72    # after failed runs, re-read at most this far back
+MAX_CATCHUP_HOURS = 168   # after failed runs, re-read at most this far back (up to 5 missed days)
 HANDLES_PER_QUERY = 15    # X search takes ~22 operators: 15 from: + since/until/2 filters
 GROUP_TOLERANCE_MINUTES = 60  # accounts whose Last Scraped are this close share a query
-SLICE_HOURS = 8           # longer windows are read oldest-first in slices of this size
+SLICE_HOURS = 30          # longer windows are read oldest-first in slices of this size
 MAX_PAGES = 10            # pages per query (~200 tweets); past that, the query is narrowed
 MAX_CALLS_PER_BATCH = 40  # credit guard per batch per run; a longer catch-up continues next run
 RETRY_WAIT_SECONDS = 10   # twitterapi.io 429 / 5xx / network error: wait, then retry once
@@ -452,7 +452,8 @@ def group_accounts(accounts, now_dt):
 
 
 def slices(since, until):
-    """[start, end) pieces of at most SLICE_HOURS, oldest first. A normal 8-hour window is one."""
+    """[start, end) pieces of at most SLICE_HOURS, oldest first. A normal day's window (24 hours,
+    plus the overlap and GitHub's start delay) is one."""
     out, step = [], SLICE_HOURS * 3600
     while since < until:
         out.append((since, min(until, since + step)))
@@ -484,10 +485,31 @@ def lookup_existing(ids, known):
             body["offset"] = page["offset"]
 
 
+def write_retried(method, chunk):
+    """Write one chunk to Scraped Content; returns (sent, written) pairs. An Airtable 5xx or
+    network error is retried once after RETRY_WAIT_SECONDS: with one run a day, a failed write
+    would otherwise cost the batch its whole day. Before retrying a create, the chunk's tweet
+    IDs are looked up again, so a create that went through despite the error isn't repeated."""
+    try:
+        return list(zip(chunk, write_batches(method, POSTS, chunk)))
+    except HttpError as e:
+        if not retryable(e):
+            raise
+        log(f"  Airtable: {e}; retrying once in {RETRY_WAIT_SECONDS}s")
+        time.sleep(RETRY_WAIT_SECONDS)
+    pairs = []
+    if method == "POST":
+        found = {}
+        lookup_existing([r["fields"][P_CONTENT_ID] for r in chunk], found)
+        pairs = [(r, {"id": found[r["fields"][P_CONTENT_ID]]["id"]}) for r in chunk if found.get(r["fields"][P_CONTENT_ID])]
+        chunk = [r for r in chunk if not found.get(r["fields"][P_CONTENT_ID])]
+    return pairs + (list(zip(chunk, write_batches(method, POSTS, chunk))) if chunk else [])
+
+
 def save_tweets(tweets, accounts, handles, known, now, per, batch, pid_updates):
     """Match one read's tweets to the batch's accounts, skip non-originals, and create or
     update them in Scraped Content. Returns the problems to flag. Raises if an Airtable write fails
-    (other than a 422, which is retried one record at a time)."""
+    twice (a 422 is retried one record at a time instead)."""
     by_id = {str(a["fields"].get(A_PLATFORM_ID) or "").strip(): a for a in accounts}
     by_id.pop("", None)
     by_handle = {h.lower(): a for h, a in zip(handles, accounts)}
@@ -541,7 +563,7 @@ def save_tweets(tweets, accounts, handles, known, now, per, batch, pid_updates):
         for i in range(0, len(records), BATCH):
             chunk = records[i:i + BATCH]
             try:
-                pairs = list(zip(chunk, write_batches(method, POSTS, chunk)))
+                pairs = write_retried(method, chunk)
             except HttpError as e:
                 if e.code != 422:
                     raise
@@ -550,7 +572,7 @@ def save_tweets(tweets, accounts, handles, known, now, per, batch, pid_updates):
                 pairs = []
                 for one in chunk:
                     try:
-                        pairs += list(zip([one], write_batches(method, POSTS, [one])))
+                        pairs += write_retried(method, [one])
                     except HttpError as e1:
                         if e1.code != 422:
                             raise

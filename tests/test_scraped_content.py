@@ -7,7 +7,7 @@ without the Thumbnail field, which was removed: thumbnails go in Media):
 an unknown field, a select value that isn't an option or a value of the wrong type is
 rejected with a 422, as Airtable does, and counted as a failure here.
 
-Ten simulated days: X every 6 hours, YouTube and Reddit daily, Instagram every 3 days, with
+Ten simulated days: X, YouTube and Reddit daily, Instagram every 3 days, with
 the same Content IDs used on every platform (c1, c2, ...) so any lookup that isn't limited to
 its own platform would update or skip another platform's row. Some rows are marked Reviewed
 along the way. Checked at the end: every returned item stored once per platform, no row
@@ -319,9 +319,9 @@ def simulate(seed, days=10):
     reviewed = set()
     for step in range(days * 4 + 1):
         SIM["now"] = T0 + timedelta(hours=6 * step, minutes=rnd.uniform(0, 30))
-        jobs = [x.main]
+        jobs = []
         if step % 4 == 1:
-            jobs += [yt.main, rd.main]
+            jobs += [x.main, yt.main, rd.main]
         if step % 12 == 2:
             jobs.append(ig.main)
         rnd.shuffle(jobs)
